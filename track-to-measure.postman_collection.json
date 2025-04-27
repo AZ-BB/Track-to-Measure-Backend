@@ -1,0 +1,184 @@
+{
+  "info": {
+    "_postman_id": "5e9f5b5b-3b0e-4c5b-b1ac-5901234e5678",
+    "name": "TrackToMeasure API",
+    "description": "API for marketing tag detection and reporting",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Scan",
+      "item": [
+        {
+          "name": "Scan URL",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"url\": \"https://example.com\",\n  \"includeCmsDetection\": true\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/scan",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "scan"]
+            },
+            "description": "Scan a URL for marketing tags"
+          },
+          "response": []
+        },
+        {
+          "name": "Get Scan History",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/scan/history",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "scan", "history"]
+            },
+            "description": "Get scan history"
+          },
+          "response": []
+        },
+        {
+          "name": "Get Scan by ID",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/scan/:id",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "scan", ":id"],
+              "variable": [
+                {
+                  "key": "id",
+                  "value": "123",
+                  "description": "Scan ID"
+                }
+              ]
+            },
+            "description": "Get scan result by ID"
+          },
+          "response": []
+        }
+      ],
+      "description": "Endpoints for scanning websites for marketing tags"
+    },
+    {
+      "name": "Report",
+      "item": [
+        {
+          "name": "Generate Report",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"url\": \"https://example.com\",\n  \"options\": {\n    \"includeRecommendations\": true,\n    \"includeCmsInfo\": true,\n    \"includeHeader\": true,\n    \"colorScheme\": \"default\"\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/report/generate",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "report", "generate"]
+            },
+            "description": "Generate a PDF report for a URL"
+          },
+          "response": []
+        },
+        {
+          "name": "Generate Report from Scan",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"scanResult\": {\n    \"url\": \"https://example.com\",\n    \"domain\": \"example.com\",\n    \"scanTime\": \"2023-04-27T12:00:00.000Z\",\n    \"tags\": [\n      {\n        \"name\": \"Google Tag Manager\",\n        \"isPresent\": true,\n        \"id\": \"GTM-XXXX\"\n      },\n      {\n        \"name\": \"GA4\",\n        \"isPresent\": true,\n        \"id\": \"G-XXXXXX\"\n      },\n      {\n        \"name\": \"Google Ads Conversion\",\n        \"isPresent\": false\n      },\n      {\n        \"name\": \"Meta Pixel\",\n        \"isPresent\": false\n      }\n    ],\n    \"recommendations\": [\n      \"Add Meta Pixel to track conversions from Facebook and Instagram ads\",\n      \"Implement Google Ads conversion tracking to optimize your ad campaigns\"\n    ]\n  },\n  \"options\": {\n    \"includeRecommendations\": true,\n    \"includeCmsInfo\": true,\n    \"includeHeader\": true,\n    \"colorScheme\": \"default\"\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/report/generate-from-scan",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "report", "generate-from-scan"]
+            },
+            "description": "Generate a PDF report from existing scan results"
+          },
+          "response": []
+        },
+        {
+          "name": "Get Report by ID",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/report/:id",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "report", ":id"],
+              "variable": [
+                {
+                  "key": "id",
+                  "value": "123",
+                  "description": "Report ID"
+                }
+              ]
+            },
+            "description": "Get report by ID"
+          },
+          "response": []
+        }
+      ],
+      "description": "Endpoints for generating PDF reports"
+    },
+    {
+      "name": "Health Check",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/api/health",
+          "host": ["{{baseUrl}}"],
+          "path": ["api", "health"]
+        },
+        "description": "Check API health"
+      },
+      "response": []
+    }
+  ],
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [""]
+      }
+    },
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [""]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:3001",
+      "type": "string"
+    }
+  ]
+} 
