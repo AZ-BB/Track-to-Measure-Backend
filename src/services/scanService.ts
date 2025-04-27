@@ -1,4 +1,4 @@
-import puppeteer, { Page } from 'puppeteer';
+import puppeteer, { Page, Browser } from 'puppeteer';
 import { TagType, TagResult, ScanResult, CmsResult } from '../utils/types';
 import { AppError } from '../middlewares/errorHandler';
 
@@ -16,6 +16,31 @@ declare global {
  * Service to scan websites for marketing tags
  */
 export class ScanService {
+  private browser: Browser | null = null;
+  
+  /**
+   * Initialize the browser instance
+   */
+  private async getBrowser(): Promise<Browser> {
+    if (!this.browser || !this.browser.isConnected()) {
+      this.browser = await puppeteer.launch({
+        headless: true,
+        args: [
+          '--no-sandbox', 
+          '--disable-setuid-sandbox', 
+          '--disable-dev-shm-usage',
+          '--disable-features=IsolateOrigins,site-per-process',
+          '--disable-web-security'
+        ],
+        defaultViewport: {
+          width: 1366,
+          height: 768
+        }
+      });
+    }
+    return this.browser;
+  }
+
   /**
    * Scans a URL for marketing tags
    */
@@ -28,13 +53,20 @@ export class ScanService {
       throw new AppError('Invalid URL provided', 400);
     }
     
+    let page: Page | null = null;
+    
     try {
-      const browser = await puppeteer.launch({
-        headless: false,
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-      });
+      // Get or create browser instance
+      const browser = await this.getBrowser();
       
-      const page = await browser.newPage();
+      // Create a new page
+      page = await browser.newPage();
+      
+      // Set user agent to appear as a regular browser
+      await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
+      
+      // Allow JavaScript execution
+      await page.setJavaScriptEnabled(true);
       
       // Set timeout for navigation
       await page.setDefaultNavigationTimeout(30000);
@@ -42,8 +74,8 @@ export class ScanService {
       // Navigate to the URL
       await page.goto(normalizedUrl, { waitUntil: 'networkidle2' });
       
-      // Wait a bit for dynamic tags to load
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      // Wait a bit longer for dynamic tags to load
+      await new Promise(resolve => setTimeout(resolve, 5000));
       
       // Get domain from URL
       const domain = new URL(normalizedUrl).hostname;
@@ -61,8 +93,9 @@ export class ScanService {
       // Generate recommendations based on missing tags
       const recommendations = this.generateRecommendations(tagResults);
       
-      // Close browser
-      await browser.close();
+      // Close page but keep browser open
+      await page.close();
+      page = null;
       
       // Return scan result
       return {
@@ -75,7 +108,25 @@ export class ScanService {
       };
     } catch (error) {
       console.error('Error scanning URL:', error);
+      // Make sure to close the page if there's an error
+      if (page) {
+        try {
+          await page.close();
+        } catch (closeError) {
+          console.error('Error closing page:', closeError);
+        }
+      }
       throw new AppError(`Failed to scan URL: ${error instanceof Error ? error.message : 'Unknown error'}`, 500);
+    }
+  }
+  
+  /**
+   * Closes the browser instance when the service is shutting down
+   */
+  async closeBrowser(): Promise<void> {
+    if (this.browser && this.browser.isConnected()) {
+      await this.browser.close();
+      this.browser = null;
     }
   }
   
