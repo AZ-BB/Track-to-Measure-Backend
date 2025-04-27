@@ -1,6 +1,16 @@
-import puppeteer from 'puppeteer';
+import puppeteer, { Page } from 'puppeteer';
 import { TagType, TagResult, ScanResult, CmsResult } from '../utils/types';
 import { AppError } from '../middlewares/errorHandler';
+
+// Add window interface extension for marketing tracking globals
+declare global {
+  interface Window {
+    dataLayer?: any[];
+    fbq?: Function;
+    _linkedin_data_partner_ids?: any;
+    pintrk?: Function;
+  }
+}
 
 /**
  * Service to scan websites for marketing tags
@@ -20,7 +30,7 @@ export class ScanService {
     
     try {
       const browser = await puppeteer.launch({
-        headless: true,
+        headless: false,
         args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
       });
       
@@ -33,7 +43,7 @@ export class ScanService {
       await page.goto(normalizedUrl, { waitUntil: 'networkidle2' });
       
       // Wait a bit for dynamic tags to load
-      await page.waitForTimeout(2000);
+      await new Promise(resolve => setTimeout(resolve, 2000));
       
       // Get domain from URL
       const domain = new URL(normalizedUrl).hostname;
@@ -72,7 +82,7 @@ export class ScanService {
   /**
    * Detects marketing tags on a page
    */
-  private async detectTags(page: puppeteer.Page): Promise<TagResult[]> {
+  private async detectTags(page: Page): Promise<TagResult[]> {
     const results: TagResult[] = [];
     
     // Detect Google Tag Manager
@@ -91,13 +101,13 @@ export class ScanService {
     const metaResult = await this.detectMetaPixel(page);
     results.push(metaResult);
     
-    // Detect LinkedIn Insight
-    const linkedinResult = await this.detectLinkedIn(page);
-    results.push(linkedinResult);
+    // // Detect LinkedIn Insight
+    // const linkedinResult = await this.detectLinkedIn(page);
+    // results.push(linkedinResult);
     
-    // Detect Pinterest
-    const pinterestResult = await this.detectPinterest(page);
-    results.push(pinterestResult);
+    // // Detect Pinterest
+    // const pinterestResult = await this.detectPinterest(page);
+    // results.push(pinterestResult);
     
     return results;
   }
@@ -105,7 +115,7 @@ export class ScanService {
   /**
    * Detects Google Tag Manager
    */
-  private async detectGoogleTagManager(page: puppeteer.Page): Promise<TagResult> {
+  private async detectGoogleTagManager(page: Page): Promise<TagResult> {
     try {
       // Check for GTM script in page source
       const hasGtmScript = await page.evaluate(() => {
@@ -114,7 +124,8 @@ export class ScanService {
         const noscriptIframes = document.querySelectorAll('iframe[src*="googletagmanager.com/ns.html"]');
         return gtmScripts.length > 0 || noscriptIframes.length > 0;
       });
-      
+      console.log(hasGtmScript);
+      // await new Promise(resolve => setTimeout(resolve, 1000000));
       // Get GTM ID if present
       let gtmId = undefined;
       if (hasGtmScript) {
@@ -159,7 +170,7 @@ export class ScanService {
   /**
    * Detects Google Analytics 4
    */
-  private async detectGA4(page: puppeteer.Page): Promise<TagResult> {
+  private async detectGA4(page: Page): Promise<TagResult> {
     try {
       // Check for GA4 script in page source
       const ga4Data = await page.evaluate(() => {
@@ -217,7 +228,7 @@ export class ScanService {
   /**
    * Detects Google Ads Conversion tracking
    */
-  private async detectGoogleAds(page: puppeteer.Page): Promise<TagResult> {
+  private async detectGoogleAds(page: Page): Promise<TagResult> {
     try {
       const gadsData = await page.evaluate(() => {
         // Check for Google Ads conversion script or gtag setups
@@ -262,7 +273,7 @@ export class ScanService {
   /**
    * Detects Meta (Facebook) Pixel
    */
-  private async detectMetaPixel(page: puppeteer.Page): Promise<TagResult> {
+  private async detectMetaPixel(page: Page): Promise<TagResult> {
     try {
       const metaData = await page.evaluate(() => {
         // Check for Meta Pixel script or fbq init
@@ -308,7 +319,7 @@ export class ScanService {
   /**
    * Detects LinkedIn Insight Tag
    */
-  private async detectLinkedIn(page: puppeteer.Page): Promise<TagResult> {
+  private async detectLinkedIn(page: Page): Promise<TagResult> {
     try {
       const isPresent = await page.evaluate(() => {
         // Check for LinkedIn Insight Tag
@@ -333,7 +344,7 @@ export class ScanService {
   /**
    * Detects Pinterest Tag
    */
-  private async detectPinterest(page: puppeteer.Page): Promise<TagResult> {
+  private async detectPinterest(page: Page): Promise<TagResult> {
     try {
       const isPresent = await page.evaluate(() => {
         // Check for Pinterest Tag
@@ -357,7 +368,7 @@ export class ScanService {
   /**
    * Detects CMS used by the website
    */
-  private async detectCms(page: puppeteer.Page): Promise<CmsResult | undefined> {
+  private async detectCms(page: Page): Promise<CmsResult | undefined> {
     try {
       return await page.evaluate(() => {
         // Check for common CMS signatures
