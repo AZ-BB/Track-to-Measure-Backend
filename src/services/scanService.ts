@@ -1,6 +1,6 @@
 import puppeteer, { Page, Browser } from 'puppeteer';
 import { TagType, TagResult, ScanResult, CmsResult } from '../utils/types';
-import { AppError } from '../middlewares/errorHandler';
+import BadRequest from '../middlewares/handlers/errors/BadRequest';
 
 // Add window interface extension for marketing tracking globals
 declare global {
@@ -50,7 +50,7 @@ export class ScanService {
     
     // Validate URL
     if (!this.isValidUrl(normalizedUrl)) {
-      throw new AppError('Invalid URL provided', 400);
+      throw new BadRequest('Invalid URL provided');
     }
     
     let page: Page | null = null;
@@ -116,7 +116,7 @@ export class ScanService {
           console.error('Error closing page:', closeError);
         }
       }
-      throw new AppError(`Failed to scan URL: ${error instanceof Error ? error.message : 'Unknown error'}`, 500);
+      throw new BadRequest(`Failed to scan URL: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
   

@@ -1,6 +1,6 @@
 import PDFDocument from 'pdfkit';
 import { ScanResult, TagResult, ReportOptions } from '../utils/types';
-import { AppError } from '../middlewares/errorHandler';
+import BadRequest from '../middlewares/handlers/errors/BadRequest';
 
 /**
  * Service to generate PDF reports from scan results
@@ -80,7 +80,7 @@ export class ReportService {
       });
     } catch (error) {
       console.error('Error generating PDF report:', error);
-      throw new AppError('Failed to generate PDF report', 500);
+      throw new BadRequest('Failed to generate PDF report');
     }
   }
   
