@@ -15,10 +15,17 @@ export const createUser = async (req: Request, res: Response, next: NextFunction
             password
         })
 
+        const token = jwt.sign({ id: user.id, email: user.email }, process.env.SECRET as string)
+
         res.status(201).json(new Result({
             status: true,
             message: "User created successfully",
-            data: user
+            data: {
+                user: {
+                    ...user,
+                    token
+                },
+            }
         }))
     } catch (error) {
         next(error)
@@ -45,7 +52,7 @@ export const googleAuthCallback = async (req: Request, res: Response, next: Next
     try {
         // Passport.js attaches the user to the request object
         const user = req.user as any;
-        
+
         if (!user) {
             return res.status(401).json(new Result({
                 status: false,
@@ -53,12 +60,13 @@ export const googleAuthCallback = async (req: Request, res: Response, next: Next
                 data: null
             }));
         }
-        
+
         // Generate JWT token
         const token = jwt.sign(
-            { id: user.id, email: user.email }, 
+            { id: user.id, email: user.email },
             process.env.SECRET as string
         );
+
         
         // Redirect to frontend with token and user data
         const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
