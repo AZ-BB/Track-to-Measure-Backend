@@ -13,7 +13,7 @@ router.post('/login', Validation.bodyValidation(UserLoginSchema), login)
 // Google OAuth routes
 router.get('/auth/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
 router.get('/auth/google/callback', 
-    passport.authenticate('google', { session: false, failureRedirect: '/login' }),
+    passport.authenticate('google', { session: false, failureRedirect: '/auth?error=Authentication%20failed' }),
     googleAuthCallback
 );
 
