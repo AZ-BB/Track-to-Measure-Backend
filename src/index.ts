@@ -3,12 +3,17 @@ import cors from "cors"
 import helmet from "helmet"
 import morgan from "morgan"
 import dotenv from "dotenv"
+dotenv.config()
+import "./db/index"
+import passport from "./config/passport"
+
 import { scanRoutes } from "./routes/scanRoutes"
 import { reportRoutes } from "./routes/reportRoutes"
-import { errorHandler } from "./middlewares/errorHandler"
+import { globalErrorHandler } from "./middlewares/handlers/GlobalErrorHandler"
+import { userRoutes } from "./routes/userRouter"
+
 
 // Load environment variables
-dotenv.config()
 
 // Create Express app
 const app = express()
@@ -27,9 +32,13 @@ app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"))
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
 
+// Initialize Passport
+app.use(passport.initialize())
+
 // Routes
 app.use("/api/scan", scanRoutes)
 app.use("/api/report", reportRoutes)
+app.use("/api/user", userRoutes)
 
 // Health check route
 app.get("/api/health", (req, res) => {
@@ -37,7 +46,7 @@ app.get("/api/health", (req, res) => {
 })
 
 // Error handling middleware
-app.use(errorHandler)
+app.use(globalErrorHandler)
 
 // Start server
 app.listen(port, () => {

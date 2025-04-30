@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import { ReportService } from '../services/reportService';
 import { ScanService } from '../services/scanService';
-import { AppError } from '../middlewares/errorHandler';
+import BadRequest from '../middlewares/handlers/errors/BadRequest';
 import { ReportOptions } from '../utils/types';
 
 // Instantiate services
@@ -21,7 +21,7 @@ export const reportController = {
       
       // Validate input
       if (!url) {
-        throw new AppError('URL is required', 400);
+        throw new BadRequest('URL is required');
       }
       
       // Parse report options
@@ -59,7 +59,7 @@ export const reportController = {
       
       // Validate input
       if (!scanResult) {
-        throw new AppError('Scan result is required', 400);
+        throw new BadRequest('Scan result is required');
       }
       
       // Parse report options
@@ -93,7 +93,7 @@ export const reportController = {
       const { id } = req.params;
       
       if (!id) {
-        throw new AppError('Report ID is required', 400);
+        throw new BadRequest('Report ID is required');
       }
       
       // This would typically fetch from a database
