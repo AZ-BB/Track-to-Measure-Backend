@@ -60,17 +60,11 @@ export const googleAuthCallback = async (req: Request, res: Response, next: Next
             process.env.SECRET as string
         );
         
-        // Return user info and token
-        return res.status(200).json(new Result({
-            status: true,
-            message: "User authenticated with Google successfully",
-            data: {
-                token,
-                id: user.id,
-                name: user.name,
-                email: user.email
-            }
-        }));
+        // Redirect to frontend with token and user data
+        const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+        const redirectUrl = `${frontendUrl}/auth/callback?token=${token}&userId=${user.id}&email=${encodeURIComponent(user.email)}&name=${encodeURIComponent(user.name || '')}`;
+        
+        return res.redirect(redirectUrl);
     } catch (error) {
         next(error);
     }

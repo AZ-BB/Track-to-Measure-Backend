@@ -7,7 +7,7 @@ import { eq } from 'drizzle-orm';
 passport.use(new GoogleStrategy({
     clientID: process.env.GOOGLE_CLIENT_ID as string,
     clientSecret: process.env.GOOGLE_CLIENT_SECRET as string,
-    callbackURL: process.env.GOOGLE_CALLBACK_URL || '/auth/google/callback',
+    callbackURL: process.env.GOOGLE_CALLBACK_URL || '/api/user/auth/google/callback',
     scope: ['profile', 'email']
 }, async (accessToken, refreshToken, profile, done) => {
     try {
