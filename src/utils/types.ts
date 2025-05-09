@@ -11,12 +11,23 @@ export enum TagType {
   TIKTOK = 'TikTok Pixel'
 }
 
+// Tag status enum for detailed reporting
+export enum TagStatus {
+  CONNECTED = 'Connected',
+  MISCONFIGURED = 'Misconfigured',
+  INCOMPLETE = 'Incomplete Setup',
+  NOT_FOUND = 'Not Found',
+  ERROR = 'Error'
+}
+
 // Tag result interface
 export interface TagResult {
   name: string;
   isPresent: boolean;
+  status: TagStatus;
   id?: string;
   details?: string;
+  dataLayer?: boolean;
 }
 
 // Scan result interface

@@ -1,5 +1,5 @@
 import puppeteer, { Page, Browser } from 'puppeteer';
-import { TagType, TagResult, ScanResult, CmsResult } from '../utils/types';
+import { TagType, TagResult, ScanResult, CmsResult, TagStatus } from '../utils/types';
 import BadRequest from '../middlewares/handlers/errors/BadRequest';
 
 // Add window interface extension for marketing tracking globals
@@ -9,6 +9,10 @@ declare global {
     fbq?: Function;
     _linkedin_data_partner_ids?: any;
     pintrk?: Function;
+    gtag?: Function;
+    google_trackConversion?: Function;
+    google_conversion_id?: string | number;
+    google_conversion_label?: string;
   }
 }
 
@@ -168,52 +172,103 @@ export class ScanService {
    */
   private async detectGoogleTagManager(page: Page): Promise<TagResult> {
     try {
-      // Check for GTM script in page source
-      const hasGtmScript = await page.evaluate(() => {
+      // Check for GTM script and dataLayer
+      const gtmData = await page.evaluate(() => {
         // Check for GTM script tag
-        const gtmScripts = document.querySelectorAll('script[src*="googletagmanager.com/gtm.js"]');
-        const noscriptIframes = document.querySelectorAll('iframe[src*="googletagmanager.com/ns.html"]');
-        return gtmScripts.length > 0 || noscriptIframes.length > 0;
-      });
-      console.log(hasGtmScript);
-      // await new Promise(resolve => setTimeout(resolve, 1000000));
-      // Get GTM ID if present
-      let gtmId = undefined;
-      if (hasGtmScript) {
-        gtmId = await page.evaluate(() => {
+        const hasGtmScript = document.querySelectorAll('script[src*="googletagmanager.com/gtm.js"]').length > 0 || 
+                           document.querySelectorAll('iframe[src*="googletagmanager.com/ns.html"]').length > 0;
+        
+        // Check for dataLayer
+        const hasDataLayer = typeof window.dataLayer !== "undefined" && Array.isArray(window.dataLayer);
+        
+        // Check for active dataLayer (has items)
+        const hasActiveDataLayer = hasDataLayer && window.dataLayer && window.dataLayer.length > 0;
+        
+        // Check for GTM activation - look for gtm.js event
+        let hasGtmActivation = false;
+        if (hasActiveDataLayer && window.dataLayer) {
+          hasGtmActivation = window.dataLayer.some(item => 
+            item && typeof item === 'object' && item.event === 'gtm.js'
+          );
+        }
+        
+        // Get GTM ID if present
+        let gtmId;
+        if (hasGtmScript) {
           // Find script with GTM initialization
           const scripts = Array.from(document.querySelectorAll('script'));
           for (const script of scripts) {
             if (script.textContent?.includes('GTM-')) {
               const match = script.textContent.match(/GTM-[A-Z0-9]+/);
-              return match ? match[0] : undefined;
+              if (match) {
+                gtmId = match[0];
+                break;
+              }
             }
           }
           
-          // Check for GTM ID in URL
-          const gtmScripts = document.querySelectorAll('script[src*="googletagmanager.com/gtm.js"]');
-          if (gtmScripts.length > 0) {
-            const src = gtmScripts[0].getAttribute('src');
-            if (src) {
-              const match = src.match(/id=GTM-[A-Z0-9]+/);
-              return match ? match[0].replace('id=', '') : undefined;
+          // Check for GTM ID in URL if not found in scripts
+          if (!gtmId) {
+            const gtmScripts = document.querySelectorAll('script[src*="googletagmanager.com/gtm.js"]');
+            if (gtmScripts.length > 0) {
+              const src = gtmScripts[0].getAttribute('src');
+              if (src) {
+                const match = src.match(/id=GTM-[A-Z0-9]+/);
+                if (match) {
+                  gtmId = match[0].replace('id=', '');
+                }
+              }
             }
           }
-          
-          return undefined;
-        });
-      }
+        }
+        
+        // Determine status based on GTM script and dataLayer presence
+        let status = 'Not Found';
+        
+        if (hasGtmScript) {
+          if (!gtmId) {
+            status = 'Incomplete Setup'; // Script present but no GTM ID found
+          } else if (!hasDataLayer) {
+            status = 'Misconfigured'; // Script and ID present but no dataLayer
+          } else if (!hasActiveDataLayer) {
+            status = 'Misconfigured'; // dataLayer exists but has no data
+          } else if (!hasGtmActivation) {
+            status = 'Misconfigured'; // dataLayer has data but no GTM activation event
+          } else {
+            status = 'Connected'; // Everything is properly set up
+          }
+        }
+        
+        return {
+          isPresent: hasGtmScript,
+          id: gtmId,
+          status,
+          hasDataLayer,
+          hasActiveEvents: hasGtmActivation
+        };
+      });
       
       return {
         name: TagType.GOOGLE_TAG_MANAGER,
-        isPresent: hasGtmScript,
-        id: gtmId
+        isPresent: gtmData.isPresent,
+        status: gtmData.status === 'Connected' ? 
+                TagStatus.CONNECTED : 
+                gtmData.status === 'Misconfigured' ? 
+                TagStatus.MISCONFIGURED : 
+                gtmData.status === 'Incomplete Setup' ? 
+                TagStatus.INCOMPLETE : 
+                TagStatus.NOT_FOUND,
+        id: gtmData.id,
+        details: gtmData.status,
+        dataLayer: gtmData.hasDataLayer
       };
     } catch (error) {
       console.error('Error detecting Google Tag Manager:', error);
       return {
         name: TagType.GOOGLE_TAG_MANAGER,
-        isPresent: false
+        isPresent: false,
+        status: TagStatus.ERROR,
+        details: 'Error during detection'
       };
     }
   }
@@ -233,10 +288,12 @@ export class ScanService {
         let ga4Id;
         
         // Check window.dataLayer for gtag config commands with G- IDs
+        let hasProperConfig = false;
         if (window.dataLayer && Array.isArray(window.dataLayer)) {
           for (const item of window.dataLayer) {
             if (item && item[0] === 'config' && typeof item[1] === 'string' && item[1].startsWith('G-')) {
               ga4Id = item[1];
+              hasProperConfig = true;
               break;
             }
           }
@@ -256,22 +313,44 @@ export class ScanService {
           }
         }
         
+        // Determine status
+        let status = 'Not Found';
+        if (hasGa4Script) {
+          if (!ga4Id) {
+            status = 'Incomplete Setup'; // GA4 script present but no Measurement ID
+          } else if (!hasProperConfig) {
+            status = 'Misconfigured'; // ID found but not properly configured in dataLayer
+          } else {
+            status = 'Connected'; // Everything is set up correctly
+          }
+        }
+        
         return {
           isPresent: hasGa4Script,
-          id: ga4Id
+          id: ga4Id,
+          status,
+          hasProperConfig
         };
       });
       
       return {
         name: TagType.GA4,
         isPresent: ga4Data.isPresent,
+        status: ga4Data.status === 'Connected' ? 
+                TagStatus.CONNECTED : 
+                ga4Data.status === 'Misconfigured' ? 
+                TagStatus.MISCONFIGURED : 
+                ga4Data.status === 'Incomplete Setup' ? 
+                TagStatus.INCOMPLETE : 
+                TagStatus.NOT_FOUND,
         id: ga4Data.id
       };
     } catch (error) {
       console.error('Error detecting GA4:', error);
       return {
         name: TagType.GA4,
-        isPresent: false
+        isPresent: false,
+        status: TagStatus.ERROR
       };
     }
   }
@@ -284,10 +363,10 @@ export class ScanService {
       const gadsData = await page.evaluate(() => {
         // Check for Google Ads conversion script or gtag setups
         const hasGads = document.querySelector('script[src*="googleadservices.com/pagead/conversion"]') !== null;
-        
+
         // Try to find Google Ads ID
         let gadsId;
-        
+
         // Check for inline conversion script
         const scripts = Array.from(document.querySelectorAll('script'));
         for (const script of scripts) {
@@ -300,23 +379,103 @@ export class ScanService {
             if (gadsId) break;
           }
         }
+
+        // Advanced dataLayer inspection for Google Ads conversions
+        let foundInDataLayer = false;
+        let hasConversionEvent = false;
+        if (window.dataLayer && Array.isArray(window.dataLayer)) {
+          for (const item of window.dataLayer) {
+            // Skip if not an object
+            if (!item || typeof item !== 'object') continue;
+            
+            // Check for direct conversion events
+            if (
+              (item['event'] && typeof item['event'] === 'string' && 
+               (item['event'].toLowerCase().includes('conversion')))
+            ) {
+              hasConversionEvent = true;
+            }
+            
+            if (
+              (item['event'] && typeof item['event'] === 'string' && 
+               (item['event'].toLowerCase().includes('conversion') || 
+                item['event'].toLowerCase() === 'gtm.dom' || 
+                item['event'].toLowerCase() === 'gtm.load' || 
+                item['event'].toLowerCase() === 'gtm.js')) ||
+              (item['send_to'] && typeof item['send_to'] === 'string' && item['send_to'].toString().startsWith('AW-'))
+            ) {
+              foundInDataLayer = true;
+              if (item['send_to'] && typeof item['send_to'] === 'string' && item['send_to'].startsWith('AW-')) {
+                gadsId = item['send_to'];
+              }
+            }
+            
+            // Look for GTM config that includes AW account
+            if (item.gtm && item.gtm.tags) {
+              const tags = item.gtm.tags;
+              for (const tagId in tags) {
+                const tag = tags[tagId];
+                if (tag && tag.tagId && tag.tagId.toString().startsWith('AW-')) {
+                  foundInDataLayer = true;
+                  gadsId = tag.tagId;
+                  break;
+                }
+              }
+            }
+          }
+        }
+
+        // Check for Google Ads global variables and function calls
+        const hasGtagAds = typeof window.gtag === 'function';
+        const hasGoogleAdsGlobals = !!(
+          window.google_trackConversion || 
+          window.google_conversion_id || 
+          window.google_conversion_label
+        );
+
+        // Also check page content for visible conversion indicators
+        const hasConversionInnerHTML = document.documentElement.innerHTML.includes('gtag(\'config\', \'AW-') ||
+                                      document.documentElement.innerHTML.includes('AW-');
+
+        const isPresent = hasGads || !!gadsId || foundInDataLayer || hasGtagAds || hasGoogleAdsGlobals || hasConversionInnerHTML;
         
+        // Determine status
+        let status = 'Not Found';
+        if (isPresent) {
+          if (!gadsId) {
+            status = 'Incomplete Setup'; // Script present but no conversion ID
+          } else if (!hasConversionEvent && !hasGoogleAdsGlobals) {
+            status = 'Misconfigured'; // ID found but no conversion events or functions
+          } else {
+            status = 'Connected'; // Everything is set up correctly
+          }
+        }
+
         return {
-          isPresent: hasGads || !!gadsId,
-          id: gadsId
+          isPresent,
+          id: gadsId,
+          status
         };
       });
-      
+
       return {
         name: TagType.GOOGLE_ADS,
         isPresent: gadsData.isPresent,
+        status: gadsData.status === 'Connected' ? 
+                TagStatus.CONNECTED : 
+                gadsData.status === 'Misconfigured' ? 
+                TagStatus.MISCONFIGURED : 
+                gadsData.status === 'Incomplete Setup' ? 
+                TagStatus.INCOMPLETE : 
+                TagStatus.NOT_FOUND,
         id: gadsData.id
       };
     } catch (error) {
       console.error('Error detecting Google Ads:', error);
       return {
         name: TagType.GOOGLE_ADS,
-        isPresent: false
+        isPresent: false,
+        status: TagStatus.ERROR
       };
     }
   }
@@ -336,6 +495,7 @@ export class ScanService {
         let pixelId;
         
         // Check for fbq('init', 'XXXXXXXXXX') calls
+        let hasInit = false;
         const scripts = Array.from(document.querySelectorAll('script'));
         for (const script of scripts) {
           if (script.textContent?.includes('fbq(') || script.textContent?.includes('_fbq.push')) {
@@ -343,26 +503,51 @@ export class ScanService {
             const matchPush = script.textContent.match(/_fbq.push\s*\(\s*\[\s*['"]init['"],\s*['"](\d+)['"]/);
             
             pixelId = match ? match[1] : matchPush ? matchPush[1] : undefined;
+            if (match || matchPush) hasInit = true;
             if (pixelId) break;
+          }
+        }
+        
+        // Check for functional fbq
+        const hasFbqFunction = typeof window.fbq === 'function';
+        
+        // Determine status
+        let status = 'Not Found';
+        if (hasMetaPixel) {
+          if (!pixelId) {
+            status = 'Incomplete Setup'; // Meta Pixel script present but no Pixel ID
+          } else if (!hasInit || !hasFbqFunction) {
+            status = 'Misconfigured'; // ID found but not properly initialized
+          } else {
+            status = 'Connected'; // Everything is set up correctly
           }
         }
         
         return {
           isPresent: hasMetaPixel,
-          id: pixelId
+          id: pixelId,
+          status
         };
       });
       
       return {
         name: TagType.META_PIXEL,
         isPresent: metaData.isPresent,
+        status: metaData.status === 'Connected' ? 
+                TagStatus.CONNECTED : 
+                metaData.status === 'Misconfigured' ? 
+                TagStatus.MISCONFIGURED : 
+                metaData.status === 'Incomplete Setup' ? 
+                TagStatus.INCOMPLETE : 
+                TagStatus.NOT_FOUND,
         id: metaData.id
       };
     } catch (error) {
       console.error('Error detecting Meta Pixel:', error);
       return {
         name: TagType.META_PIXEL,
-        isPresent: false
+        isPresent: false,
+        status: TagStatus.ERROR
       };
     }
   }
@@ -372,22 +557,46 @@ export class ScanService {
    */
   private async detectLinkedIn(page: Page): Promise<TagResult> {
     try {
-      const isPresent = await page.evaluate(() => {
+      const linkedInData = await page.evaluate(() => {
         // Check for LinkedIn Insight Tag
-        return document.querySelector('script[src*="_linkedin_data_partner_id"]') !== null ||
-               document.querySelector('script[src*="snap.licdn.com"]') !== null ||
-               typeof window._linkedin_data_partner_ids !== 'undefined';
+        const hasScript = document.querySelector('script[src*="_linkedin_data_partner_id"]') !== null ||
+                         document.querySelector('script[src*="snap.licdn.com"]') !== null;
+        const hasGlobal = typeof window._linkedin_data_partner_ids !== 'undefined';
+        const isPresent = hasScript || hasGlobal;
+        
+        // Determine status
+        let status = 'Not Found';
+        if (isPresent) {
+          if (!hasGlobal) {
+            status = 'Misconfigured'; // Script found but no partner IDs variable
+          } else {
+            status = 'Connected'; // Everything seems properly set up
+          }
+        }
+        
+        return {
+          isPresent,
+          status
+        };
       });
       
       return {
         name: TagType.LINKEDIN,
-        isPresent
+        isPresent: linkedInData.isPresent,
+        status: linkedInData.status === 'Connected' ? 
+                TagStatus.CONNECTED : 
+                linkedInData.status === 'Misconfigured' ? 
+                TagStatus.MISCONFIGURED : 
+                linkedInData.status === 'Incomplete Setup' ? 
+                TagStatus.INCOMPLETE : 
+                TagStatus.NOT_FOUND
       };
     } catch (error) {
       console.error('Error detecting LinkedIn Insight Tag:', error);
       return {
         name: TagType.LINKEDIN,
-        isPresent: false
+        isPresent: false,
+        status: TagStatus.ERROR
       };
     }
   }
@@ -397,21 +606,45 @@ export class ScanService {
    */
   private async detectPinterest(page: Page): Promise<TagResult> {
     try {
-      const isPresent = await page.evaluate(() => {
+      const pinterestData = await page.evaluate(() => {
         // Check for Pinterest Tag
-        return document.querySelector('script[src*="pintrk.js"]') !== null ||
-               typeof window.pintrk === 'function';
+        const hasScript = document.querySelector('script[src*="pintrk.js"]') !== null;
+        const hasFunction = typeof window.pintrk === 'function';
+        const isPresent = hasScript || hasFunction;
+        
+        // Determine status
+        let status = 'Not Found';
+        if (isPresent) {
+          if (!hasFunction) {
+            status = 'Misconfigured'; // Script found but function not available
+          } else {
+            status = 'Connected'; // Everything seems properly set up
+          }
+        }
+        
+        return {
+          isPresent,
+          status
+        };
       });
       
       return {
         name: TagType.PINTEREST,
-        isPresent
+        isPresent: pinterestData.isPresent,
+        status: pinterestData.status === 'Connected' ? 
+                TagStatus.CONNECTED : 
+                pinterestData.status === 'Misconfigured' ? 
+                TagStatus.MISCONFIGURED : 
+                pinterestData.status === 'Incomplete Setup' ? 
+                TagStatus.INCOMPLETE : 
+                TagStatus.NOT_FOUND
       };
     } catch (error) {
       console.error('Error detecting Pinterest Tag:', error);
       return {
         name: TagType.PINTEREST,
-        isPresent: false
+        isPresent: false,
+        status: TagStatus.ERROR
       };
     }
   }
