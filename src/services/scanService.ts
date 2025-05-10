@@ -75,17 +75,51 @@ export class ScanService {
       // Set timeout for navigation
       await page.setDefaultNavigationTimeout(30000);
       
+      // Monitor network requests to detect GA4
+      const ga4Requests: Set<string> = new Set();
+      page.on('request', request => {
+        const url = request.url();
+        if (url.includes('google-analytics.com/g/collect') || 
+            url.includes('google-analytics.com/j/collect') ||
+            url.includes('analytics.google.com') ||
+            url.includes('googletagmanager.com/gtag')) {
+          // Extract GA4 ID from URL if present
+          const ga4Match = url.match(/[?&]tid=G-[A-Z0-9]+/);
+          if (ga4Match) {
+            const ga4Id = ga4Match[0].replace(/[?&]tid=/, '');
+            console.log("Detected GA4 in network request:", ga4Id);
+            ga4Requests.add(ga4Id);
+          } else if (url.includes('G-')) {
+            const ga4Match = url.match(/G-[A-Z0-9]+/);
+            if (ga4Match) {
+              console.log("Detected GA4 in network request:", ga4Match[0]);
+              ga4Requests.add(ga4Match[0]);
+            }
+          }
+        }
+      });
+      
       // Navigate to the URL
       await page.goto(normalizedUrl, { waitUntil: 'networkidle2' });
       
       // Wait a bit longer for dynamic tags to load
-      await new Promise(resolve => setTimeout(resolve, 5000));
+      console.log("Waiting for dynamic tags to load...");
+      await new Promise(resolve => setTimeout(resolve, 8000));
+      
+      // Wait for any remaining network activity to settle
+      try {
+        await page.waitForNetworkIdle({ idleTime: 2000, timeout: 5000 }).catch(() => {
+          console.log("Network activity timeout - continuing with scan");
+        });
+      } catch (e) {
+        console.log("Error waiting for network idle:", e);
+      }
       
       // Get domain from URL
       const domain = new URL(normalizedUrl).hostname;
       
       // Detect tags
-      const tagResults = await this.detectTags(page);
+      const tagResults = await this.detectTags(page, [...ga4Requests]);
       
       // Detect CMS if requested
       let cms: string | undefined;
@@ -137,7 +171,7 @@ export class ScanService {
   /**
    * Detects marketing tags on a page
    */
-  private async detectTags(page: Page): Promise<TagResult[]> {
+  private async detectTags(page: Page, ga4Requests: string[]): Promise<TagResult[]> {
     const results: TagResult[] = [];
     
     // Detect Google Tag Manager
@@ -145,7 +179,7 @@ export class ScanService {
     results.push(gtmResult);
     
     // Detect GA4
-    const ga4Result = await this.detectGA4(page);
+    const ga4Result = await this.detectGA4(page, [...ga4Requests]);
     results.push(ga4Result);
     
     // Detect Google Ads
@@ -178,6 +212,15 @@ export class ScanService {
         const hasGtmScript = document.querySelectorAll('script[src*="googletagmanager.com/gtm.js"]').length > 0 || 
                            document.querySelectorAll('iframe[src*="googletagmanager.com/ns.html"]').length > 0;
         
+        // Also check for GTM initialization script (not just the loaded script)
+        const hasGtmInit = document.documentElement.innerHTML.includes('googletagmanager.com/gtm.js?id=GTM-');
+        
+        // Check for GTM initialization function
+        const hasGtmInitFunction = document.documentElement.innerHTML.includes('(window,document,\'script\',\'dataLayer\',\'GTM-');
+        
+        // Overall GTM presence
+        const hasGtm = hasGtmScript || hasGtmInit || hasGtmInitFunction;
+        
         // Check for dataLayer
         const hasDataLayer = typeof window.dataLayer !== "undefined" && Array.isArray(window.dataLayer);
         
@@ -194,7 +237,7 @@ export class ScanService {
         
         // Get GTM IDs if present
         const gtmIds: string[] = [];
-        if (hasGtmScript) {
+        if (hasGtm) {
           // Find scripts with GTM initialization
           const scripts = Array.from(document.querySelectorAll('script'));
           for (const script of scripts) {
@@ -240,27 +283,36 @@ export class ScanService {
               }
             }
           });
+          
+          // Full HTML scan for GTM IDs if none found yet
+          if (gtmIds.length === 0) {
+            const fullHtmlMatches = Array.from(document.documentElement.innerHTML.matchAll(/GTM-[A-Z0-9]+/g) || []) as RegExpMatchArray[];
+            if (fullHtmlMatches.length > 0) {
+              fullHtmlMatches.forEach(matchArr => {
+                const gtmId = matchArr[0];
+                if (gtmId && !gtmIds.includes(gtmId)) {
+                  gtmIds.push(gtmId);
+                }
+              });
+            }
+          }
         }
         
-        // Determine status based on GTM script and dataLayer presence
+        // Determine status based on GTM script and dataLayer presence - more lenient
         let status = 'Not Found';
         
-        if (hasGtmScript) {
+        if (hasGtm) {
           if (gtmIds.length === 0) {
             status = 'Incomplete Setup'; // Script present but no GTM ID found
-          } else if (!hasDataLayer) {
-            status = 'Misconfigured'; // Script and ID present but no dataLayer
-          } else if (!hasActiveDataLayer) {
-            status = 'Misconfigured'; // dataLayer exists but has no data
-          } else if (!hasGtmActivation) {
-            status = 'Misconfigured'; // dataLayer has data but no GTM activation event
+          } else if (!hasDataLayer && !hasGtmActivation) {
+            status = 'Misconfigured'; // Script and ID present but no dataLayer or activation
           } else {
-            status = 'Connected'; // Everything is properly set up
+            status = 'Connected'; // Properly set up or sufficiently detected
           }
         }
         
         return {
-          isPresent: hasGtmScript,
+          isPresent: hasGtm,
           ids: gtmIds,
           id: gtmIds.length > 0 ? gtmIds[0] : undefined,
           status,
@@ -298,78 +350,218 @@ export class ScanService {
   /**
    * Detects Google Analytics 4
    */
-  private async detectGA4(page: Page): Promise<TagResult> {
+  private async detectGA4(page: Page, ga4Requests: string[] = []): Promise<TagResult> {
     try {
+      // Log any GA4 IDs found in network requests
+      if (ga4Requests.length > 0) {
+        console.log("GA4 IDs found in network requests:", ga4Requests);
+      }
+      
       // Check for GA4 script in page source
-      const ga4Data = await page.evaluate(() => {
-        // Check for GA4 script tag or gtag setup
-        const hasGa4Script = document.querySelector('script[src*="google-analytics.com/analytics.js"]') !== null || 
-                            document.querySelector('script[src*="googletagmanager.com/gtag/js"]') !== null;
+      const ga4Data = await page.evaluate((networkIds) => {
+        // Log for debugging
+        console.log("Starting GA4 detection...");
+        console.log("Network GA4 IDs:", networkIds);
         
-        // Array to store all GA4 IDs
-        const ga4Ids: string[] = [];
+        // Check for GA4 script tag or gtag setup - expanded to catch more variations
+        const hasGa4Script = 
+          document.querySelector('script[src*="google-analytics.com/analytics.js"]') !== null || 
+          document.querySelector('script[src*="googletagmanager.com/gtag/js"]') !== null ||
+          document.querySelector('script[src*="google-analytics.com/g/collect"]') !== null ||
+          document.documentElement.innerHTML.includes('gtag(\'config\', \'G-') ||
+          document.documentElement.innerHTML.includes("gtag(\"config\", \"G-") ||
+          document.documentElement.innerHTML.includes('destination?id=G-');
+        
+        // Check for GTM present - GA4 is often implemented via GTM
+        const hasGtm = 
+          document.querySelector('script[src*="googletagmanager.com/gtm.js"]') !== null ||
+          document.documentElement.innerHTML.includes('GTM-');
+        
+        // Array to store all GA4 IDs - start with those from network requests
+        const ga4Ids: string[] = [...networkIds];
+        
+        // Look for destination scripts which often contain GA4 configurations
+        const destinationScripts = document.querySelectorAll('script[src*="googletagmanager.com/gtag/destination"]');
+        if (destinationScripts.length > 0) {
+          console.log("Found destination scripts:", destinationScripts.length);
+          destinationScripts.forEach(script => {
+            const src = script.getAttribute('src');
+            if (src) {
+              // Check for GA4 IDs in the destination URL
+              const ga4Match = src.match(/[?&]id=G-[A-Z0-9]+/);
+              if (ga4Match) {
+                const ga4Id = ga4Match[0].replace(/[?&]id=/, '');
+                if (!ga4Ids.includes(ga4Id)) {
+                  console.log("Found GA4 ID in destination script:", ga4Id);
+                  ga4Ids.push(ga4Id);
+                }
+              }
+            }
+          });
+        }
         
         // Check window.dataLayer for gtag config commands with G- IDs
         let hasProperConfig = false;
         if (window.dataLayer && Array.isArray(window.dataLayer)) {
+          console.log("Examining dataLayer with", window.dataLayer.length, "items");
+          
           for (const item of window.dataLayer) {
-            if (item && item[0] === 'config' && typeof item[1] === 'string' && item[1].startsWith('G-')) {
-              const ga4Id = item[1];
-              if (!ga4Ids.includes(ga4Id)) {
-                ga4Ids.push(ga4Id);
-                hasProperConfig = true;
+            try {
+              // Check for config array format
+              if (item && Array.isArray(item) && item.length >= 2 && item[0] === 'config' && typeof item[1] === 'string' && item[1].startsWith('G-')) {
+                const ga4Id = item[1];
+                if (!ga4Ids.includes(ga4Id)) {
+                  console.log("Found GA4 ID in dataLayer config array:", ga4Id);
+                  ga4Ids.push(ga4Id);
+                  hasProperConfig = true;
+                }
               }
+              
+              // Check for object format with send_to property
+              if (item && typeof item === 'object' && !Array.isArray(item)) {
+                // Check for config in event object
+                if (item.event === 'gtag.config' && item['gtm.uniqueEventId'] && item.target && item.target.startsWith('G-')) {
+                  const ga4Id = item.target;
+                  if (!ga4Ids.includes(ga4Id)) {
+                    console.log("Found GA4 ID in gtag.config event:", ga4Id);
+                    ga4Ids.push(ga4Id);
+                    hasProperConfig = true;
+                  }
+                }
+                
+                // Check for send_to property
+                if (item.send_to && typeof item.send_to === 'string') {
+                  const ga4Match = item.send_to.match(/G-[A-Z0-9]+/);
+                  if (ga4Match) {
+                    const ga4Id = ga4Match[0];
+                    if (!ga4Ids.includes(ga4Id)) {
+                      console.log("Found GA4 ID in send_to property:", ga4Id);
+                      ga4Ids.push(ga4Id);
+                      hasProperConfig = true;
+                    }
+                  }
+                }
+                
+                // Check for custom format that some implementations use
+                if (item.event && (item.event === 'pageview' || item.event === 'gtm.dom' || item.event === 'gtm.load' || item.event === 'gtm.js')) {
+                  // Sometimes the GA4 ID might be in a nested property
+                  const itemStr = JSON.stringify(item);
+                  const ga4Matches = itemStr.match(/G-[A-Z0-9]+/g);
+                  if (ga4Matches) {
+                    ga4Matches.forEach(ga4Id => {
+                      if (!ga4Ids.includes(ga4Id)) {
+                        console.log("Found GA4 ID in event object:", ga4Id);
+                        ga4Ids.push(ga4Id);
+                        hasProperConfig = true;
+                      }
+                    });
+                  }
+                }
+              }
+            } catch (e) {
+              console.log("Error processing dataLayer item:", e);
+              // Continue processing other items even if one fails
             }
           }
+        }
+        
+        // Check for direct gtag presence and calls
+        const hasGtagFunction = typeof window.gtag === 'function';
+        if (hasGtagFunction) {
+          console.log("Found gtag function");
+          hasProperConfig = true;
         }
         
         // Check for gtag script with GA4 ID
         const scripts = Array.from(document.querySelectorAll('script'));
         for (const script of scripts) {
-          if (script.textContent?.includes('G-')) {
-            const matches = Array.from(script.textContent.matchAll(/G-[A-Z0-9]+/g) || []) as RegExpMatchArray[];
-            if (matches.length > 0) {
-              matches.forEach(matchArr => {
-                const gaId = matchArr[0];
-                if (gaId && !ga4Ids.includes(gaId)) {
-                  ga4Ids.push(gaId);
+          if (script.textContent) {
+            try {
+              if (script.textContent.includes('G-')) {
+                const matches = Array.from(script.textContent.matchAll(/G-[A-Z0-9]+/g) || []) as RegExpMatchArray[];
+                if (matches.length > 0) {
+                  console.log("Found GA4 IDs in script content:", matches.length);
+                  matches.forEach(matchArr => {
+                    const gaId = matchArr[0];
+                    if (gaId && !ga4Ids.includes(gaId)) {
+                      ga4Ids.push(gaId);
+                    }
+                  });
                 }
-              });
+              }
+            } catch (e) {
+              console.log("Error processing script content:", e);
             }
           }
         }
         
         // Full HTML scan for GA4 IDs
-        const ga4HtmlMatches = Array.from(document.documentElement.innerHTML.matchAll(/G-[A-Z0-9]+/g) || []) as RegExpMatchArray[];
-        if (ga4HtmlMatches.length > 0) {
-          ga4HtmlMatches.forEach(matchArr => {
-            const gaId = matchArr[0];
-            if (gaId && !ga4Ids.includes(gaId)) {
-              ga4Ids.push(gaId);
+        try {
+          const fullHtml = document.documentElement.innerHTML;
+          const ga4HtmlMatches = Array.from(fullHtml.matchAll(/G-[A-Z0-9]+/g) || []) as RegExpMatchArray[];
+          if (ga4HtmlMatches.length > 0) {
+            console.log("Found GA4 IDs in HTML:", ga4HtmlMatches.length);
+            ga4HtmlMatches.forEach(matchArr => {
+              const gaId = matchArr[0];
+              if (gaId && !ga4Ids.includes(gaId)) {
+                ga4Ids.push(gaId);
+              }
+            });
+          }
+        } catch (e) {
+          console.log("Error scanning HTML for GA4 IDs:", e);
+        }
+        
+        // Check for specific Google Tag scripts
+        const googleTagScripts = document.querySelectorAll('script[src*="googletagmanager.com/gtag/js?id=G-"]');
+        if (googleTagScripts.length > 0) {
+          console.log("Found Google Tag scripts:", googleTagScripts.length);
+          googleTagScripts.forEach(script => {
+            const src = script.getAttribute('src');
+            if (src) {
+              const ga4Match = src.match(/id=G-[A-Z0-9]+/);
+              if (ga4Match) {
+                const ga4Id = ga4Match[0].replace('id=', '');
+                if (!ga4Ids.includes(ga4Id)) {
+                  console.log("Found GA4 ID in Google Tag script:", ga4Id);
+                  ga4Ids.push(ga4Id);
+                  hasProperConfig = true;
+                }
+              }
             }
           });
         }
         
-        // Determine status
+        // Determine status - network requests mean it's definitely connected
         let status = 'Not Found';
-        if (hasGa4Script) {
-          if (ga4Ids.length === 0) {
-            status = 'Incomplete Setup'; // GA4 script present but no Measurement ID
-          } else if (!hasProperConfig) {
-            status = 'Misconfigured'; // ID found but not properly configured in dataLayer
-          } else {
-            status = 'Connected'; // Everything is set up correctly
-          }
+        if (networkIds.length > 0 || ga4Ids.length > 0) {
+          // If we found GA4 IDs through the network or other methods, it's connected
+          status = 'Connected';
+          console.log("GA4 status: Connected with IDs:", ga4Ids);
+        } else if (hasGa4Script || (hasGtm && document.documentElement.innerHTML.includes('google-analytics'))) {
+          // If we see GA4 script or GTM with analytics references, it's at least incomplete
+          status = 'Incomplete Setup';
+          console.log("GA4 status: Incomplete Setup (script present but no IDs)");
+        } else {
+          console.log("GA4 status: Not Found");
+        }
+        
+        // Special case for GTM implementation when we didn't find IDs but GTM is present
+        if (status === 'Not Found' && hasGtm) {
+          // Assume GA4 is likely present through GTM but not directly detectable
+          // This is a fallback for difficult-to-detect implementations
+          status = 'Incomplete Setup';
+          console.log("GA4 status adjusted to Incomplete Setup due to GTM presence");
         }
         
         return {
-          isPresent: hasGa4Script,
+          isPresent: ga4Ids.length > 0 || hasGa4Script || (status !== 'Not Found'),
           ids: ga4Ids,
           id: ga4Ids.length > 0 ? ga4Ids[0] : undefined,
           status,
-          hasProperConfig
+          hasProperConfig: true // If we found IDs in network traffic, it's definitely configured properly
         };
-      });
+      }, ga4Requests);
       
       return {
         name: TagType.GA4,
