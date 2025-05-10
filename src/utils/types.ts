@@ -22,10 +22,11 @@ export enum TagStatus {
 
 // Tag result interface
 export interface TagResult {
-  name: string;
+  name: TagType;
   isPresent: boolean;
   status: TagStatus;
   id?: string;
+  ids?: string[];
   details?: string;
   dataLayer?: boolean;
 }
