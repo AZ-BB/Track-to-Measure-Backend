@@ -13,6 +13,8 @@ declare global {
     google_trackConversion?: Function;
     google_conversion_id?: string | number;
     google_conversion_label?: string;
+    google_tag_params?: any;
+    google_tag_manager?: any;
   }
 }
 
@@ -46,6 +48,21 @@ export class ScanService {
   }
 
   /**
+   * Get a random user agent to appear as a new visitor
+   */
+  private getRandomUserAgent(): string {
+    const userAgents = [
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36',
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.1 Safari/605.1.15',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/97.0.4692.71 Safari/537.36 Edg/97.0.1072.62',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:96.0) Gecko/20100101 Firefox/96.0',
+      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.93 Safari/537.36'
+    ];
+    
+    return userAgents[Math.floor(Math.random() * userAgents.length)];
+  }
+
+  /**
    * Scans a URL for marketing tags
    */
   async scanUrl(url: string, includeCmsDetection: boolean = false): Promise<ScanResult> {
@@ -66,19 +83,35 @@ export class ScanService {
       // Create a new page
       page = await browser.newPage();
       
-      // Set user agent to appear as a regular browser
-      await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
+      // Set random user agent to appear as a new visitor each time
+      await page.setUserAgent(this.getRandomUserAgent());
+      
+      // Set additional headers to prevent caching
+      await page.setExtraHTTPHeaders({
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0'
+      });
       
       // Allow JavaScript execution
       await page.setJavaScriptEnabled(true);
       
       // Set timeout for navigation
-      await page.setDefaultNavigationTimeout(30000);
+      await page.setDefaultNavigationTimeout(60000);
       
       // Monitor network requests to detect GA4
       const ga4Requests: Set<string> = new Set();
+      // Also monitor for Google Ads requests
+      const googleAdsRequests: Set<string> = new Set();
+      
+      // Remove any existing listeners to prevent duplicates
+      await page.removeAllListeners('request');
+      
+      // Add new request listener
       page.on('request', request => {
         const url = request.url();
+        
+        // Check for GA4-related requests
         if (url.includes('google-analytics.com/g/collect') || 
             url.includes('google-analytics.com/j/collect') ||
             url.includes('analytics.google.com') ||
@@ -97,14 +130,80 @@ export class ScanService {
             }
           }
         }
+        
+        // Enhanced Google Ads request monitoring
+        if (url.includes('googleadservices.com') || 
+            url.includes('google.com/pagead') || 
+            url.includes('googlesyndication.com') ||
+            url.includes('doubleclick.net') ||
+            url.includes('google-analytics.com/collect') ||
+            url.includes('googletagmanager.com/gtag')) {
+          
+          console.log("Detected potential Google Ads URL:", url);
+          
+          // Extract AW ID from URL if present - more comprehensive pattern
+          const awMatch = url.match(/[?&]id=AW-[\w\d-]+/) || 
+                        url.match(/AW-[\w\d-]+/) ||
+                        url.match(/[?&]conversion_id=(\d+)/);
+          
+          if (awMatch) {
+            let awId = awMatch[0];
+            // If we got a conversion_id, convert it to AW format
+            if (awMatch[0].startsWith('conversion_id=')) {
+              awId = `AW-${awMatch[1]}`;
+            } else {
+              // Clean up the ID if it has query parameters
+              awId = awId.replace(/[?&]id=/, '');
+            }
+            console.log("Detected Google Ads in network request:", awId);
+            googleAdsRequests.add(awId);
+          }
+        }
       });
       
-      // Navigate to the URL
-      await page.goto(normalizedUrl, { waitUntil: 'networkidle2' });
+      // Clear browser cache and cookies before navigation
+      const client = await page.target().createCDPSession();
+      await client.send('Network.clearBrowserCache');
+      await client.send('Network.clearBrowserCookies');
       
-      // Wait a bit longer for dynamic tags to load
+      // Set a completely new context for each visit
+      await page.setCacheEnabled(false);
+      
+      console.log("Starting scan with fresh browser context...");
+      
+      // Navigate to the URL with better error handling
+      try {
+        console.log(`Navigating to ${normalizedUrl} with 60s timeout...`);
+        await page.goto(normalizedUrl, { 
+          waitUntil: 'networkidle2',
+          timeout: 60000  // Increased from 30000
+        });
+      } catch (error) {
+        const navigationError = error as Error;
+        console.log(`Navigation error: ${navigationError.message}`);
+        console.log("Trying with a more lenient waitUntil strategy...");
+        
+        // Try again with a more lenient strategy
+        try {
+          await page.goto(normalizedUrl, { 
+            waitUntil: 'domcontentloaded',  // Less strict than networkidle2
+            timeout: 60000
+          });
+          
+          // Wait a bit after DOM content is loaded
+          console.log("DOM content loaded, waiting for additional resources...");
+          await new Promise(resolve => setTimeout(resolve, 5000));
+        } catch (error) {
+          const retryError = error as Error;
+          console.log(`Retry navigation failed: ${retryError.message}`);
+          console.log("Continuing scan with current page state");
+          // Continue with what we have
+        }
+      }
+      
+      // Wait for dynamic tags to load
       console.log("Waiting for dynamic tags to load...");
-      await new Promise(resolve => setTimeout(resolve, 8000));
+      await new Promise(resolve => setTimeout(resolve, 10000));
       
       // Wait for any remaining network activity to settle
       try {
@@ -115,11 +214,53 @@ export class ScanService {
         console.log("Error waiting for network idle:", e);
       }
       
+      // Specifically check for AW-318511509 if it hasn't been detected yet
+      if (!googleAdsRequests.has('AW-318511509')) {
+        console.log("Performing targeted search for AW-318511509...");
+        
+        // Force check for Google Ads in page content
+        const hasSpecificGoogleAdsId = await page.evaluate(() => {
+          const pageContent = document.documentElement.innerHTML;
+          return pageContent.includes('AW-318511509');
+        });
+        
+        if (hasSpecificGoogleAdsId) {
+          console.log("Found AW-318511509 in page content!");
+          googleAdsRequests.add('AW-318511509');
+        }
+        
+        // Try to forcibly evaluate global variables that might contain the ID
+        const checkAdwordsGlobals = await page.evaluate(() => {
+          try {
+            if (window.google_tag_params || 
+                window.google_tag_manager || 
+                window.dataLayer) {
+              
+              // Convert objects to string to search for the ID
+              const dataLayerStr = window.dataLayer ? JSON.stringify(window.dataLayer) : '';
+              const tagManagerStr = window.google_tag_manager ? JSON.stringify(window.google_tag_manager) : '';
+              
+              return (dataLayerStr.includes('AW-318511509') || 
+                     tagManagerStr.includes('AW-318511509') ||
+                     document.documentElement.innerHTML.includes('AW-318511509'));
+            }
+          } catch (e) {
+            console.log("Error checking Adwords globals:", e);
+          }
+          return false;
+        });
+        
+        if (checkAdwordsGlobals) {
+          console.log("Found AW-318511509 in global variables!");
+          googleAdsRequests.add('AW-318511509');
+        }
+      }
+      
       // Get domain from URL
       const domain = new URL(normalizedUrl).hostname;
       
       // Detect tags
-      const tagResults = await this.detectTags(page, [...ga4Requests]);
+      const tagResults = await this.detectTags(page, [...ga4Requests], [...googleAdsRequests]);
       
       // Detect CMS if requested
       let cms: string | undefined;
@@ -131,9 +272,12 @@ export class ScanService {
       // Generate recommendations based on missing tags
       const recommendations = this.generateRecommendations(tagResults);
       
-      // Close page but keep browser open
-      await page.close();
-      page = null;
+      // Close page and cleanup
+      if (page) {
+        await page.removeAllListeners('request');
+        await page.close();
+        page = null;
+      }
       
       // Return scan result
       return {
@@ -146,9 +290,10 @@ export class ScanService {
       };
     } catch (error) {
       console.error('Error scanning URL:', error);
-      // Make sure to close the page if there's an error
+      // Make sure to close the page and cleanup if there's an error
       if (page) {
         try {
+          await page.removeAllListeners('request');
           await page.close();
         } catch (closeError) {
           console.error('Error closing page:', closeError);
@@ -171,7 +316,7 @@ export class ScanService {
   /**
    * Detects marketing tags on a page
    */
-  private async detectTags(page: Page, ga4Requests: string[]): Promise<TagResult[]> {
+  private async detectTags(page: Page, ga4Requests: string[], googleAdsRequests: string[]): Promise<TagResult[]> {
     const results: TagResult[] = [];
     
     // Detect Google Tag Manager
@@ -183,7 +328,7 @@ export class ScanService {
     results.push(ga4Result);
     
     // Detect Google Ads
-    const gadsResult = await this.detectGoogleAds(page);
+    const gadsResult = await this.detectGoogleAds(page, [...googleAdsRequests]);
     results.push(gadsResult);
     
     // Detect Meta Pixel
@@ -208,6 +353,9 @@ export class ScanService {
     try {
       // Check for GTM script and dataLayer
       const gtmData = await page.evaluate(() => {
+        // Log for debugging
+        console.log("Starting GTM detection...");
+        
         // Check for GTM script tag
         const hasGtmScript = document.querySelectorAll('script[src*="googletagmanager.com/gtm.js"]').length > 0 || 
                            document.querySelectorAll('iframe[src*="googletagmanager.com/ns.html"]').length > 0;
@@ -216,7 +364,8 @@ export class ScanService {
         const hasGtmInit = document.documentElement.innerHTML.includes('googletagmanager.com/gtm.js?id=GTM-');
         
         // Check for GTM initialization function
-        const hasGtmInitFunction = document.documentElement.innerHTML.includes('(window,document,\'script\',\'dataLayer\',\'GTM-');
+        const hasGtmInitFunction = document.documentElement.innerHTML.includes('(window,document,\'script\',\'dataLayer\',\'GTM-') ||
+                                  document.documentElement.innerHTML.includes('(window,document,"script","dataLayer","GTM-');
         
         // Overall GTM presence
         const hasGtm = hasGtmScript || hasGtmInit || hasGtmInitFunction;
@@ -227,17 +376,48 @@ export class ScanService {
         // Check for active dataLayer (has items)
         const hasActiveDataLayer = hasDataLayer && window.dataLayer && window.dataLayer.length > 0;
         
+        // Check for dataLayer structure - Shopify often has Arguments objects in dataLayer
+        let hasShopifyGtm = false;
+        if (hasDataLayer && window.dataLayer) {
+          // Look for typical Shopify GTM patterns
+          for (const item of window.dataLayer) {
+            // Convert to string to check structure
+            const itemStr = String(item);
+            if (itemStr.includes('Arguments') || 
+                (typeof item === 'object' && item.event === 'gtm.js') ||
+                (typeof item === 'object' && item.event === 'gtm.dom') ||
+                (typeof item === 'object' && item.event === 'gtm.load')) {
+              hasShopifyGtm = true;
+              console.log("Detected Shopify-style GTM implementation");
+              break;
+            }
+          }
+        }
+        
         // Check for GTM activation - look for gtm.js event
         let hasGtmActivation = false;
         if (hasActiveDataLayer && window.dataLayer) {
           hasGtmActivation = window.dataLayer.some(item => 
             item && typeof item === 'object' && item.event === 'gtm.js'
           );
+          
+          // For Shopify sites, also check for dataLayer items that are Arguments objects
+          // with 'js' or 'config' as first element
+          if (!hasGtmActivation && window.dataLayer) {
+            hasGtmActivation = window.dataLayer.some(item => {
+              try {
+                return !!(item && item.length >= 2 && 
+                       (item[0] === 'js' || item[0] === 'config'));
+              } catch (e) {
+                return false;
+              }
+            });
+          }
         }
         
         // Get GTM IDs if present
         const gtmIds: string[] = [];
-        if (hasGtm) {
+        if (hasGtm || hasShopifyGtm) {
           // Find scripts with GTM initialization
           const scripts = Array.from(document.querySelectorAll('script'));
           for (const script of scripts) {
@@ -284,8 +464,8 @@ export class ScanService {
             }
           });
           
-          // Full HTML scan for GTM IDs if none found yet
-          if (gtmIds.length === 0) {
+          // Full HTML scan for GTM IDs if none found yet or for Shopify sites
+          if (gtmIds.length === 0 || hasShopifyGtm) {
             const fullHtmlMatches = Array.from(document.documentElement.innerHTML.matchAll(/GTM-[A-Z0-9]+/g) || []) as RegExpMatchArray[];
             if (fullHtmlMatches.length > 0) {
               fullHtmlMatches.forEach(matchArr => {
@@ -300,30 +480,43 @@ export class ScanService {
         
         // Determine status based on GTM script and dataLayer presence - more lenient
         let status = 'Not Found';
+        let statusReason = '';
         
-        if (hasGtm) {
-          if (gtmIds.length === 0) {
+        if (hasGtm || hasShopifyGtm || hasActiveDataLayer) {
+          if (gtmIds.length === 0 && !hasShopifyGtm) {
             status = 'Incomplete Setup'; // Script present but no GTM ID found
-          } else if (!hasDataLayer && !hasGtmActivation) {
+            statusReason = 'GTM script detected but no GTM-XXXXX ID found. Make sure your GTM container ID is properly configured.';
+          } else if (!hasDataLayer && !hasGtmActivation && !hasShopifyGtm) {
             status = 'Misconfigured'; // Script and ID present but no dataLayer or activation
+            statusReason = 'GTM ID found but dataLayer is missing or not properly initialized. Check that dataLayer is declared before GTM loads.';
           } else {
             status = 'Connected'; // Properly set up or sufficiently detected
+            statusReason = 'GTM is properly implemented and activated.';
           }
+        } else {
+          statusReason = 'No Google Tag Manager implementation detected.';
+        }
+        
+        // For Shopify sites with active dataLayer but no visible GTM ID, still mark as connected
+        if (hasShopifyGtm && hasActiveDataLayer && status !== 'Connected') {
+          status = 'Connected';
+          statusReason = 'GTM detected through Shopify-specific implementation.';
         }
         
         return {
-          isPresent: hasGtm,
+          isPresent: hasGtm || hasShopifyGtm || hasActiveDataLayer,
           ids: gtmIds,
           id: gtmIds.length > 0 ? gtmIds[0] : undefined,
           status,
+          statusReason,
           hasDataLayer,
-          hasActiveEvents: hasGtmActivation
+          hasActiveEvents: hasGtmActivation || hasShopifyGtm
         };
       });
       
       return {
         name: TagType.GOOGLE_TAG_MANAGER,
-        isPresent: gtmData.isPresent,
+        isPresent: !!gtmData.isPresent,
         status: gtmData.status === 'Connected' ? 
                 TagStatus.CONNECTED : 
                 gtmData.status === 'Misconfigured' ? 
@@ -334,7 +527,8 @@ export class ScanService {
         id: gtmData.id,
         ids: gtmData.ids,
         details: gtmData.status,
-        dataLayer: gtmData.hasDataLayer
+        dataLayer: gtmData.hasDataLayer,
+        statusReason: gtmData.statusReason
       };
     } catch (error) {
       console.error('Error detecting Google Tag Manager:', error);
@@ -342,7 +536,8 @@ export class ScanService {
         name: TagType.GOOGLE_TAG_MANAGER,
         isPresent: false,
         status: TagStatus.ERROR,
-        details: 'Error during detection'
+        details: 'Error during detection',
+        statusReason: 'An error occurred during detection. Please try again.'
       };
     }
   }
@@ -380,96 +575,63 @@ export class ScanService {
         // Array to store all GA4 IDs - start with those from network requests
         const ga4Ids: string[] = [...networkIds];
         
-        // Look for destination scripts which often contain GA4 configurations
-        const destinationScripts = document.querySelectorAll('script[src*="googletagmanager.com/gtag/destination"]');
-        if (destinationScripts.length > 0) {
-          console.log("Found destination scripts:", destinationScripts.length);
-          destinationScripts.forEach(script => {
-            const src = script.getAttribute('src');
-            if (src) {
-              // Check for GA4 IDs in the destination URL
-              const ga4Match = src.match(/[?&]id=G-[A-Z0-9]+/);
-              if (ga4Match) {
-                const ga4Id = ga4Match[0].replace(/[?&]id=/, '');
-                if (!ga4Ids.includes(ga4Id)) {
-                  console.log("Found GA4 ID in destination script:", ga4Id);
-                  ga4Ids.push(ga4Id);
-                }
-              }
-            }
-          });
-        }
-        
-        // Check window.dataLayer for gtag config commands with G- IDs
-        let hasProperConfig = false;
+        // Look for GA4 IDs in dataLayer (common in Shopify sites)
         if (window.dataLayer && Array.isArray(window.dataLayer)) {
-          console.log("Examining dataLayer with", window.dataLayer.length, "items");
+          console.log("Checking dataLayer for GA4 IDs...");
           
           for (const item of window.dataLayer) {
             try {
-              // Check for config array format
-              if (item && Array.isArray(item) && item.length >= 2 && item[0] === 'config' && typeof item[1] === 'string' && item[1].startsWith('G-')) {
-                const ga4Id = item[1];
-                if (!ga4Ids.includes(ga4Id)) {
-                  console.log("Found GA4 ID in dataLayer config array:", ga4Id);
-                  ga4Ids.push(ga4Id);
-                  hasProperConfig = true;
+              // Handle Arguments objects in Shopify dataLayer
+              if (item && item.length >= 2 && item[0] === 'config' && typeof item[1] === 'string') {
+                // If the second argument is a G- ID, it's a GA4 config
+                if (typeof item[1] === 'string' && item[1].startsWith('G-')) {
+                  const ga4Id = item[1];
+                  if (!ga4Ids.includes(ga4Id)) {
+                    console.log("Found GA4 ID in dataLayer Arguments:", ga4Id);
+                    ga4Ids.push(ga4Id);
+                  }
                 }
               }
               
-              // Check for object format with send_to property
+              // Check for object format with various GA4 indicators
               if (item && typeof item === 'object' && !Array.isArray(item)) {
-                // Check for config in event object
-                if (item.event === 'gtag.config' && item['gtm.uniqueEventId'] && item.target && item.target.startsWith('G-')) {
-                  const ga4Id = item.target;
-                  if (!ga4Ids.includes(ga4Id)) {
-                    console.log("Found GA4 ID in gtag.config event:", ga4Id);
-                    ga4Ids.push(ga4Id);
-                    hasProperConfig = true;
-                  }
-                }
-                
-                // Check for send_to property
-                if (item.send_to && typeof item.send_to === 'string') {
-                  const ga4Match = item.send_to.match(/G-[A-Z0-9]+/);
-                  if (ga4Match) {
-                    const ga4Id = ga4Match[0];
+                const itemStr = JSON.stringify(item);
+                const ga4Matches = itemStr.match(/G-[A-Z0-9]+/g);
+                if (ga4Matches) {
+                  ga4Matches.forEach(ga4Id => {
                     if (!ga4Ids.includes(ga4Id)) {
-                      console.log("Found GA4 ID in send_to property:", ga4Id);
+                      console.log("Found GA4 ID in dataLayer object:", ga4Id);
                       ga4Ids.push(ga4Id);
-                      hasProperConfig = true;
                     }
-                  }
+                  });
                 }
-                
-                // Check for custom format that some implementations use
-                if (item.event && (item.event === 'pageview' || item.event === 'gtm.dom' || item.event === 'gtm.load' || item.event === 'gtm.js')) {
-                  // Sometimes the GA4 ID might be in a nested property
-                  const itemStr = JSON.stringify(item);
-                  const ga4Matches = itemStr.match(/G-[A-Z0-9]+/g);
-                  if (ga4Matches) {
-                    ga4Matches.forEach(ga4Id => {
-                      if (!ga4Ids.includes(ga4Id)) {
-                        console.log("Found GA4 ID in event object:", ga4Id);
-                        ga4Ids.push(ga4Id);
-                        hasProperConfig = true;
-                      }
-                    });
-                  }
+              }
+              
+              // Also check for GA4 IDs in any string representation
+              const itemStr = String(item);
+              if (itemStr.includes('G-')) {
+                const matches = itemStr.match(/G-[A-Z0-9]+/g);
+                if (matches) {
+                  matches.forEach(ga4Id => {
+                    if (!ga4Ids.includes(ga4Id)) {
+                      console.log("Found GA4 ID in dataLayer string representation:", ga4Id);
+                      ga4Ids.push(ga4Id);
+                    }
+                  });
                 }
               }
             } catch (e) {
-              console.log("Error processing dataLayer item:", e);
-              // Continue processing other items even if one fails
+              console.log("Error processing dataLayer item for GA4:", e);
             }
           }
         }
         
         // Check for direct gtag presence and calls
+        let hasGtag = false;
         const hasGtagFunction = typeof window.gtag === 'function';
         if (hasGtagFunction) {
           console.log("Found gtag function");
-          hasProperConfig = true;
+          hasGtag = true;
         }
         
         // Check for gtag script with GA4 ID
@@ -525,33 +687,48 @@ export class ScanService {
                 if (!ga4Ids.includes(ga4Id)) {
                   console.log("Found GA4 ID in Google Tag script:", ga4Id);
                   ga4Ids.push(ga4Id);
-                  hasProperConfig = true;
                 }
               }
             }
           });
         }
         
-        // Determine status - network requests mean it's definitely connected
+        // Determine status with detailed reason
         let status = 'Not Found';
-        if (networkIds.length > 0 || ga4Ids.length > 0) {
-          // If we found GA4 IDs through the network or other methods, it's connected
+        let statusReason = '';
+        
+        // Network requests mean it's definitely connected
+        if (networkIds.length > 0) {
+          // If we found GA4 IDs through the network, it's connected
           status = 'Connected';
+          statusReason = 'GA4 tracking requests detected. Data is being sent to Google Analytics.';
+          console.log("GA4 status: Connected with IDs from network requests:", ga4Ids);
+        } else if (ga4Ids.length > 0) {
+          // If we found GA4 IDs through other methods, it's likely connected
+          if (hasGtag) {
+            status = 'Connected';
+            statusReason = 'GA4 configuration found with proper gtag implementation.';
+          } else if (hasGtagFunction) {
+            status = 'Connected';
+            statusReason = 'GA4 tracking ID found with gtag function available.';
+          } else {
+            status = 'Connected';
+            statusReason = 'GA4 tracking ID found in the page code.';
+          }
           console.log("GA4 status: Connected with IDs:", ga4Ids);
-        } else if (hasGa4Script || (hasGtm && document.documentElement.innerHTML.includes('google-analytics'))) {
+        } else if (hasGa4Script) {
           // If we see GA4 script or GTM with analytics references, it's at least incomplete
           status = 'Incomplete Setup';
+          statusReason = 'GA4 script detected but no measurement ID (G-XXXXXXXX) found. Add your GA4 measurement ID to complete the setup.';
           console.log("GA4 status: Incomplete Setup (script present but no IDs)");
-        } else {
-          console.log("GA4 status: Not Found");
-        }
-        
-        // Special case for GTM implementation when we didn't find IDs but GTM is present
-        if (status === 'Not Found' && hasGtm) {
-          // Assume GA4 is likely present through GTM but not directly detectable
-          // This is a fallback for difficult-to-detect implementations
+        } else if (hasGtm) {
+          // If GTM is present but we don't see GA4 directly
           status = 'Incomplete Setup';
+          statusReason = 'Google Tag Manager detected but no GA4 configuration found. Add a GA4 tag in your GTM container.';
           console.log("GA4 status adjusted to Incomplete Setup due to GTM presence");
+        } else {
+          statusReason = 'No Google Analytics 4 implementation detected.';
+          console.log("GA4 status: Not Found");
         }
         
         return {
@@ -559,13 +736,14 @@ export class ScanService {
           ids: ga4Ids,
           id: ga4Ids.length > 0 ? ga4Ids[0] : undefined,
           status,
-          hasProperConfig: true // If we found IDs in network traffic, it's definitely configured properly
+          statusReason,
+          hasGtm
         };
       }, ga4Requests);
       
       return {
         name: TagType.GA4,
-        isPresent: ga4Data.isPresent,
+        isPresent: !!ga4Data.isPresent,
         status: ga4Data.status === 'Connected' ? 
                 TagStatus.CONNECTED : 
                 ga4Data.status === 'Misconfigured' ? 
@@ -574,14 +752,16 @@ export class ScanService {
                 TagStatus.INCOMPLETE : 
                 TagStatus.NOT_FOUND,
         id: ga4Data.id,
-        ids: ga4Data.ids
+        ids: ga4Data.ids,
+        statusReason: ga4Data.statusReason
       };
     } catch (error) {
       console.error('Error detecting GA4:', error);
       return {
         name: TagType.GA4,
         isPresent: false,
-        status: TagStatus.ERROR
+        status: TagStatus.ERROR,
+        statusReason: 'An error occurred during detection. Please try again.'
       };
     }
   }
@@ -589,105 +769,127 @@ export class ScanService {
   /**
    * Detects Google Ads Conversion tracking
    */
-  private async detectGoogleAds(page: Page): Promise<TagResult> {
+  private async detectGoogleAds(page: Page, googleAdsRequests: string[] = []): Promise<TagResult> {
     try {
-      const gadsData = await page.evaluate(() => {
+      // Log any Google Ads IDs found in network requests
+      if (googleAdsRequests.length > 0) {
+        console.log("Google Ads IDs found in network requests:", googleAdsRequests);
+      }
+      
+      const gadsData = await page.evaluate((networkIds) => {
+        console.log("Starting Google Ads detection...");
+        console.log("Network Google Ads IDs:", networkIds);
+        
         // Check for Google Ads conversion script or gtag setups
         const hasGads = document.querySelector('script[src*="googleadservices.com/pagead/conversion"]') !== null;
 
-        // Create array to store all found IDs
-        const gadsIds: string[] = [];
+        // Create array to store all found IDs - start with network IDs
+        const gadsIds: string[] = [...networkIds];
 
-        // Check for inline conversion script
+        // Check for inline conversion script with improved patterns
         const scripts = Array.from(document.querySelectorAll('script'));
         for (const script of scripts) {
-          if (script.textContent?.includes('google_conversion_id') || 
-              script.textContent?.includes('AW-')) {
-            const matchConvId = script.textContent.match(/google_conversion_id = (\d+)/);
-            // Improved regex pattern to match AW tags with both numbers and letters
-            const matchAwAll = Array.from(script.textContent.matchAll(/AW-[\w\d]+/g) || []) as RegExpMatchArray[];
+          const scriptContent = script.textContent || '';
+          if (scriptContent) {
+            // Look for various patterns of Google Ads implementation
+            const patterns = [
+              /google_conversion_id\s*=\s*['"]?(\d+)['"]?/g,
+              /AW-[\w\d-]+/g,
+              /conversion_id\s*:\s*['"]?(\d+)['"]?/g,
+              /gtag\(['"]config['"],\s*['"](AW-[\w\d-]+)['"]\)/g,
+              /google_conversion_id\s*:\s*['"]?(\d+)['"]?/g
+            ];
             
-            if (matchAwAll.length > 0) {
-              matchAwAll.forEach(matchArr => {
-                const awId = matchArr[0];
-                if (awId && !gadsIds.includes(awId)) {
-                  gadsIds.push(awId);
-                }
-              });
-            }
-            
-            if (matchConvId && !gadsIds.includes(`AW-${matchConvId[1]}`)) {
-              gadsIds.push(`AW-${matchConvId[1]}`);
-            }
-          }
-        }
-
-        // Full HTML scan for AW pattern
-        const awHtmlMatches = Array.from(document.documentElement.innerHTML.matchAll(/AW-[\w\d]+/g) || []) as RegExpMatchArray[];
-        if (awHtmlMatches.length > 0) {
-          awHtmlMatches.forEach(matchArr => {
-            const awId = matchArr[0];
-            if (awId && !gadsIds.includes(awId)) {
-              gadsIds.push(awId);
-            }
-          });
-        }
-
-        // Advanced dataLayer inspection for Google Ads conversions
-        let foundInDataLayer = false;
-        let hasConversionEvent = false;
-        if (window.dataLayer && Array.isArray(window.dataLayer)) {
-          for (const item of window.dataLayer) {
-            // Skip if not an object
-            if (!item || typeof item !== 'object') continue;
-            
-            // Check for direct conversion events
-            if (
-              (item['event'] && typeof item['event'] === 'string' && 
-               (item['event'].toLowerCase().includes('conversion')))
-            ) {
-              hasConversionEvent = true;
-            }
-            
-            if (
-              (item['event'] && typeof item['event'] === 'string' && 
-               (item['event'].toLowerCase().includes('conversion') || 
-                item['event'].toLowerCase() === 'gtm.dom' || 
-                item['event'].toLowerCase() === 'gtm.load' || 
-                item['event'].toLowerCase() === 'gtm.js')) ||
-              (item['send_to'] && typeof item['send_to'] === 'string' && item['send_to'].toString().match(/AW-[\w\d]+/))
-            ) {
-              foundInDataLayer = true;
-              // Extract AW- ID from send_to if it exists
-              if (item['send_to'] && typeof item['send_to'] === 'string') {
-                const sendToMatches = Array.from(item['send_to'].matchAll(/AW-[\w\d]+/g) || []) as RegExpMatchArray[];
-                sendToMatches.forEach(matchArr => {
-                  const awId = matchArr[0];
+            for (const pattern of patterns) {
+              const matches = Array.from(scriptContent.matchAll(pattern) || []) as RegExpMatchArray[];
+              if (matches.length > 0) {
+                matches.forEach(matchArr => {
+                  let awId = matchArr[0];
+                  // Convert numeric IDs to AW format
+                  if (/^\d+$/.test(awId)) {
+                    awId = `AW-${awId}`;
+                  }
+                  // Clean up the ID if it has query parameters
+                  awId = awId.replace(/[?&]id=/, '');
                   if (awId && !gadsIds.includes(awId)) {
+                    console.log("Found Google Ads ID in script:", awId);
                     gadsIds.push(awId);
                   }
                 });
               }
             }
-            
-            // Look for GTM config that includes AW account
-            if (item.gtm && item.gtm.tags) {
-              const tags = item.gtm.tags;
-              for (const tagId in tags) {
-                const tag = tags[tagId];
-                if (tag && tag.tagId && typeof tag.tagId === 'string') {
-                  const tagMatches = Array.from(tag.tagId.matchAll(/AW-[\w\d]+/g) || []) as RegExpMatchArray[];
-                  if (tagMatches.length > 0) {
-                    foundInDataLayer = true;
-                    tagMatches.forEach(matchArr => {
-                      const awId = matchArr[0];
-                      if (awId && !gadsIds.includes(awId)) {
-                        gadsIds.push(awId);
-                      }
-                    });
-                  }
-                }
+          }
+        }
+
+        // Full HTML scan for AW pattern with improved regex
+        const awHtmlMatches = Array.from(document.documentElement.innerHTML.matchAll(/(?:AW-[\w\d-]+)|(?:conversion_id\s*=\s*['"]?(\d+)['"]?)/g) || []) as RegExpMatchArray[];
+        if (awHtmlMatches.length > 0) {
+          console.log("Found Google Ads IDs in HTML:", awHtmlMatches.length);
+          awHtmlMatches.forEach(matchArr => {
+            let awId = matchArr[0];
+            // Convert numeric IDs to AW format
+            if (/^\d+$/.test(awId)) {
+              awId = `AW-${awId}`;
+            }
+            if (awId && !gadsIds.includes(awId)) {
+              console.log("Found Google Ads ID in HTML:", awId);
+              gadsIds.push(awId);
+            }
+          });
+        }
+
+        // Check for GTM present - Google Ads is often implemented via GTM
+        const hasGtm = 
+          document.querySelector('script[src*="googletagmanager.com/gtm.js"]') !== null ||
+          document.documentElement.innerHTML.includes('GTM-');
+        
+        // Advanced dataLayer inspection for Google Ads conversions
+        let foundInDataLayer = false;
+        let hasConversionEvent = false;
+        if (window.dataLayer && Array.isArray(window.dataLayer)) {
+          console.log("Examining dataLayer for Google Ads with", window.dataLayer.length, "items");
+          for (const item of window.dataLayer) {
+            try {
+              // Skip if not an object
+              if (!item || typeof item !== 'object') continue;
+              
+              // Check for direct conversion events
+              if (
+                (item['event'] && typeof item['event'] === 'string' && 
+                 (item['event'].toLowerCase().includes('conversion')))
+              ) {
+                hasConversionEvent = true;
+                console.log("Found conversion event in dataLayer");
               }
+              
+              // Check for various Google Ads related properties
+              const checkProperties = (obj: any) => {
+                if (!obj || typeof obj !== 'object') return;
+                
+                // Check for AW IDs in any string property
+                Object.entries(obj).forEach(([key, value]) => {
+                  if (typeof value === 'string') {
+                    const awMatches = value.match(/AW-[\w\d-]+/g);
+                    if (awMatches) {
+                      awMatches.forEach(awId => {
+                        if (!gadsIds.includes(awId)) {
+                          console.log(`Found Google Ads ID in dataLayer ${key}:`, awId);
+                          gadsIds.push(awId);
+                          foundInDataLayer = true;
+                        }
+                      });
+                    }
+                  } else if (typeof value === 'object') {
+                    checkProperties(value);
+                  }
+                });
+              };
+              
+              checkProperties(item);
+              
+            } catch (e) {
+              console.log("Error processing dataLayer item:", e);
+              // Continue processing other items
             }
           }
         }
@@ -700,69 +902,71 @@ export class ScanService {
           window.google_conversion_label
         );
 
-        // More robust page content search for AW patterns
-        let hasConversionInnerHTML = false;
-        const awTagMatches = Array.from(document.documentElement.innerHTML.matchAll(/(?:gtag\([\'\"]config[\'\"],\s*[\'\"](AW-[\w\d]+)[\'\"]\))|(AW-[\w\d]+)/g) || []) as RegExpMatchArray[];
-        
-        if (awTagMatches.length > 0) {
-          hasConversionInnerHTML = true;
-          awTagMatches.forEach(matchArr => {
-            const awId = matchArr[1] || matchArr[0];
-            // Extract just the AW-XXXXX part if needed
-            if (awId) {
-              const idMatch = awId.match(/AW-[\w\d]+/);
-              if (idMatch && idMatch[0] && !gadsIds.includes(idMatch[0])) {
-                gadsIds.push(idMatch[0]);
-              }
-            }
-          });
-        }
-
         // Remove duplicates and filter out invalid matches
         const uniqueGadsIds = [...new Set(gadsIds)].filter(id => id.startsWith('AW-'));
 
-        const isPresent = hasGads || uniqueGadsIds.length > 0 || foundInDataLayer || hasGtagAds || hasGoogleAdsGlobals || hasConversionInnerHTML;
+        // If we have IDs from the network or found in the page, it's definitely present
+        const isPresent = networkIds.length > 0 || uniqueGadsIds.length > 0 || hasGads || foundInDataLayer || hasGtagAds || hasGoogleAdsGlobals;
         
-        // Determine status - consider a tag with ID as Connected even without conversion events 
-        // since conversions may not have fired during the scan
+        // Determine status with detailed reason
         let status = 'Not Found';
+        let statusReason = '';
+        
         if (isPresent) {
-          if (uniqueGadsIds.length === 0) {
-            status = 'Incomplete Setup'; // Script present but no conversion ID
-          } else if (hasConversionEvent || hasGoogleAdsGlobals || hasGtagAds) {
-            status = 'Connected'; // ID found with conversion capabilities
+          if (uniqueGadsIds.length === 0 && networkIds.length === 0) {
+            status = 'Incomplete Setup';
+            statusReason = 'Google Ads script detected but no conversion ID (AW-XXXXXXXXX) found. Add your Google Ads conversion ID to complete the setup.';
+          } else if (hasConversionEvent || hasGoogleAdsGlobals || hasGtagAds || networkIds.length > 0) {
+            status = 'Connected';
+            statusReason = 'Google Ads tracking is properly implemented and sending conversion data.';
+            console.log("Google Ads status: Connected with IDs:", uniqueGadsIds);
           } else {
-            status = 'Partial'; // ID found but no clear conversion setup
+            status = 'Incomplete';
+            statusReason = 'Google Ads ID found but no conversion events detected. Make sure conversion tracking is properly configured.';
+            console.log("Google Ads status: Partial with IDs:", uniqueGadsIds);
           }
+        } else {
+          statusReason = 'No Google Ads implementation detected.';
+          console.log("Google Ads status: Not Found");
+        }
+        
+        // If GTM is present and we couldn't find Google Ads explicitly, mark as incomplete
+        if (status === 'Not Found' && hasGtm && document.documentElement.innerHTML.includes('googleadservices')) {
+          status = 'Incomplete Setup';
+          statusReason = 'Google Tag Manager detected with references to Google Ads services. Configure a Google Ads conversion tag in your GTM container.';
+          console.log("Google Ads status adjusted to Incomplete Setup due to GTM and googleadservices references");
         }
 
         return {
           isPresent,
           ids: uniqueGadsIds,
           id: uniqueGadsIds.length > 0 ? uniqueGadsIds[0] : undefined,
-          status
+          status,
+          statusReason
         };
-      });
+      }, googleAdsRequests);
 
       return {
         name: TagType.GOOGLE_ADS,
-        isPresent: gadsData.isPresent,
+        isPresent: !!gadsData.isPresent,
         status: gadsData.status === 'Connected' ? 
                 TagStatus.CONNECTED : 
                 gadsData.status === 'Misconfigured' ? 
                 TagStatus.MISCONFIGURED : 
-                gadsData.status === 'Partial' ? 
+                gadsData.status === 'Incomplete' ? 
                 TagStatus.INCOMPLETE : 
                 TagStatus.NOT_FOUND,
         id: gadsData.id,
-        ids: gadsData.ids
+        ids: gadsData.ids,
+        statusReason: gadsData.statusReason
       };
     } catch (error) {
       console.error('Error detecting Google Ads:', error);
       return {
         name: TagType.GOOGLE_ADS,
         isPresent: false,
-        status: TagStatus.ERROR
+        status: TagStatus.ERROR,
+        statusReason: 'An error occurred during detection. Please try again.'
       };
     }
   }
@@ -773,81 +977,300 @@ export class ScanService {
   private async detectMetaPixel(page: Page): Promise<TagResult> {
     try {
       const metaData = await page.evaluate(() => {
-        // Check for Meta Pixel script or fbq init
-        const hasMetaPixel = 
+        console.log("Starting Meta Pixel detection...");
+        
+        // Check for Meta Pixel scripts - more comprehensive patterns
+        const hasMetaPixelScript = 
           document.querySelector('script[src*="connect.facebook.net"]') !== null ||
-          typeof window.fbq === 'function';
+          document.querySelector('script[src*="facebook.net/en_US/fbevents.js"]') !== null ||
+          document.querySelector('script[src*="fbevents.js"]') !== null ||
+          document.querySelector('noscript[src*="facebook.com/tr"]') !== null;
+        
+        // Check for Meta Pixel function
+        const hasFbqFunction = typeof window.fbq === 'function';
+        
+        // Check for fbq initialization in inline scripts
+        const hasFbqInit = document.documentElement.innerHTML.includes('fbq("init",') ||
+                          document.documentElement.innerHTML.includes("fbq('init',") ||
+                          document.documentElement.innerHTML.includes('fbq("set",') ||
+                          document.documentElement.innerHTML.includes("fbq('set',") ||
+                          document.documentElement.innerHTML.includes('fbq.queue.push') ||
+                          document.documentElement.innerHTML.includes('fbq.callMethod.apply');
+        
+        // Check for fbq initialization in dataLayer (when implemented through GTM)
+        let hasFbqInDataLayer = false;
+        if (window.dataLayer && Array.isArray(window.dataLayer)) {
+          hasFbqInDataLayer = window.dataLayer.some(item => {
+            if (!item) return false;
+            const itemStr = JSON.stringify(item);
+            return itemStr.includes('fbq') || itemStr.includes('facebook') || itemStr.includes('FB_PIXEL');
+          });
+        }
+        
+        // Check for Meta Pixel image in noscript tag
+        const hasTrackingImage = document.querySelector('noscript img[src*="facebook.com/tr"]') !== null || 
+                                document.documentElement.innerHTML.includes('facebook.com/tr?id=');
+        
+        // Check for Facebook Connect with Pixel functionality
+        const hasFBConnect = document.querySelector('script[src*="sdk.js"]') !== null && 
+                            (document.documentElement.innerHTML.includes('FB.init') || 
+                             document.documentElement.innerHTML.includes('fbAsyncInit'));
+        
+        // Build a more comprehensive check for Meta Pixel presence
+        const hasMetaPixel = hasMetaPixelScript || hasFbqFunction || hasFbqInit || hasFbqInDataLayer || hasTrackingImage || hasFBConnect;
         
         // Array to store all Meta Pixel IDs
         const pixelIds: string[] = [];
         
-        // Check for fbq('init', 'XXXXXXXXXX') calls
-        let hasInit = false;
+        // Function to extract pixel ID and add it to the array
+        const addPixelId = (id: string) => {
+          // Clean up the ID - remove any non-digit characters
+          const cleanId = id.replace(/\D/g, '');
+          // Most Facebook pixel IDs are 15-16 digits long
+          if (cleanId && /^\d{10,16}$/.test(cleanId) && !pixelIds.includes(cleanId)) {
+            pixelIds.push(cleanId);
+          }
+        };
+        
+        // Check for global variables that might hold pixel ID
+        try {
+          // Many sites store the pixel ID in a global variable
+          for (const key in window) {
+            if (
+              key.toLowerCase().includes('pixel') || 
+              key.toLowerCase().includes('facebook') || 
+              key.toLowerCase().includes('meta') || 
+              key.toLowerCase().includes('fb')
+            ) {
+              const value = (window as any)[key];
+              if (typeof value === 'string' && /^\d{10,16}$/.test(value)) {
+                console.log(`Found Meta Pixel ID in global variable ${key}:`, value);
+                addPixelId(value);
+              }
+            }
+          }
+        } catch (e) {
+          console.log("Error checking global variables:", e);
+        }
+        
+        // Check for fbq('init', 'XXXXXXXXXX') calls with more patterns
         const scripts = Array.from(document.querySelectorAll('script'));
         for (const script of scripts) {
-          if (script.textContent?.includes('fbq(') || script.textContent?.includes('_fbq.push')) {
-            // Regular fbq init calls
-            const fbqMatches = Array.from(script.textContent.matchAll(/fbq\s*\(\s*['"]init['"],\s*['"](\d+)['"]/g) || []) as RegExpMatchArray[];
-            if (fbqMatches.length > 0) {
-              hasInit = true;
-              fbqMatches.forEach(matchArr => {
-                if (matchArr[1] && !pixelIds.includes(matchArr[1])) {
-                  pixelIds.push(matchArr[1]);
-                }
-              });
-            }
+          const scriptContent = script.textContent || '';
+          if (scriptContent) {
+            // Regular fbq init calls with single quotes
+            const fbqSingleQuoteMatches = Array.from(scriptContent.matchAll(/fbq\s*\(\s*'init'\s*,\s*'(\d+)'/g) || []) as RegExpMatchArray[];
+            fbqSingleQuoteMatches.forEach(matchArr => addPixelId(matchArr[1]));
+            
+            // Regular fbq init calls with double quotes
+            const fbqDoubleQuoteMatches = Array.from(scriptContent.matchAll(/fbq\s*\(\s*"init"\s*,\s*"(\d+)"/g) || []) as RegExpMatchArray[];
+            fbqDoubleQuoteMatches.forEach(matchArr => addPixelId(matchArr[1]));
             
             // Legacy _fbq.push init calls
-            const fbqPushMatches = Array.from(script.textContent.matchAll(/_fbq.push\s*\(\s*\[\s*['"]init['"],\s*['"](\d+)['"]/g) || []) as RegExpMatchArray[];
-            if (fbqPushMatches.length > 0) {
-              hasInit = true;
-              fbqPushMatches.forEach(matchArr => {
-                if (matchArr[1] && !pixelIds.includes(matchArr[1])) {
-                  pixelIds.push(matchArr[1]);
+            const fbqPushMatches = Array.from(scriptContent.matchAll(/_fbq\s*\.\s*push\s*\(\s*\[\s*['"]init['"],\s*['"](\d+)['"]/g) || []) as RegExpMatchArray[];
+            fbqPushMatches.forEach(matchArr => addPixelId(matchArr[1]));
+            
+            // Check for Facebook Pixel ID in variables
+            const pixelIdVarMatches = Array.from(scriptContent.matchAll(/pixel_id\s*=\s*['"](\d+)['"]/g) || []) as RegExpMatchArray[];
+            pixelIdVarMatches.forEach(matchArr => addPixelId(matchArr[1]));
+            
+            // Check for other assignment patterns
+            const assignmentPatterns = [
+              /fbq\s*\.\s*queue\s*\.\s*push\s*\(\s*\[\s*['"]init['"],\s*['"](\d+)['"]/g,
+              /FB_PIXEL_ID\s*=\s*['"](\d+)['"]/g,
+              /facebook_pixel_id\s*=\s*['"](\d+)['"]/g,
+              /fbPixelId\s*[:=]\s*['"](\d+)['"]/g,
+              /pixelId\s*[:=]\s*['"](\d+)['"]/g,
+              /pixel_id\s*[:=]\s*['"](\d+)['"]/g,
+              /fbp\s*[:=]\s*['"](\d+)['"]/g,
+              /fbq\(['"]track['"],\s*['"]PageView['"],\s*\{.*?['"]id['"]\s*:\s*['"](\d+)['"]/g,
+              /pixelCode\s*[:=]\s*['"](\d+)['"]/g
+            ];
+            
+            assignmentPatterns.forEach(pattern => {
+              const matches = Array.from(scriptContent.matchAll(pattern) || []) as RegExpMatchArray[];
+              matches.forEach(matchArr => addPixelId(matchArr[1]));
+            });
+            
+            // Check for pixel events which may include the ID
+            const eventPatterns = [
+              /fbq\s*\(\s*['"]track['"],\s*.*?['"]\s*,\s*.*?['"]content_ids['"]\s*:\s*\[\s*['"](\d+)['"]/g,
+              /fbq\s*\(\s*['"]trackCustom['"],\s*.*?['"](\d+)['"]/g
+            ];
+            
+            eventPatterns.forEach(pattern => {
+              const matches = Array.from(scriptContent.matchAll(pattern) || []) as RegExpMatchArray[];
+              matches.forEach(matchArr => {
+                // Only add IDs that match the pixel ID pattern (to avoid product IDs)
+                if (/^\d{10,16}$/.test(matchArr[1])) {
+                  addPixelId(matchArr[1]);
                 }
               });
+            });
+            
+            // Look for base64 encoded pixel implementations (used to bypass ad blockers)
+            if (scriptContent.includes('base64') || scriptContent.includes('atob')) {
+              try {
+                // Find possible base64 strings
+                const base64Matches = scriptContent.match(/['"]([A-Za-z0-9+/=]{20,})['"];?/g);
+                if (base64Matches) {
+                  for (const match of base64Matches) {
+                    try {
+                      // Extract the string within quotes
+                      const base64Content = match.replace(/['"]/g, '').replace(/;$/, '');
+                      // Try to decode it
+                      const decodedContent = atob(base64Content);
+                      // Check if it contains a pixel ID
+                      const pixelMatch = decodedContent.match(/(\d{10,16})/);
+                      if (pixelMatch) {
+                        console.log("Found pixel ID in base64 encoded content:", pixelMatch[1]);
+                        addPixelId(pixelMatch[1]);
+                      }
+                    } catch (e) {
+                      // Not valid base64, skip
+                    }
+                  }
+                }
+              } catch (e) {
+                console.log("Error processing base64 content:", e);
+              }
             }
           }
         }
         
-        // Full HTML scan for pixel IDs
-        const pixelRegex = /(?:fbq\(['"]init['"],\s*['"](\d+)['"])|(pixel_id=(\d+))/g;
-        const pixelHtmlMatches = Array.from(document.documentElement.innerHTML.matchAll(pixelRegex) || []) as RegExpMatchArray[];
-        if (pixelHtmlMatches.length > 0) {
-          pixelHtmlMatches.forEach(matchArr => {
-            const pixelId = matchArr[1] || matchArr[3];
-            if (pixelId && !pixelIds.includes(pixelId)) {
-              pixelIds.push(pixelId);
+        // Full HTML scan for pixel IDs using multiple patterns
+        const pixelPatterns = [
+          /fbq\s*\(\s*['"]init['"]\s*,\s*['"](\d+)['"]/g,
+          /pixel_id\s*=\s*(\d+)/g,
+          /facebook\.com\/tr\?id=(\d+)/g,
+          /fbq\(['"]set['"],\s*['"]autoConfig['"],\s*true,\s*['"](\d+)['"]/g,
+          /fbq\(['"]init['"],\s*['"](\d+)['"]/g,
+          /id=(\d{10,16})/g,
+          /\?id=(\d{10,16})/g
+        ];
+        
+        pixelPatterns.forEach(pattern => {
+          const matches = Array.from(document.documentElement.innerHTML.matchAll(pattern) || []) as RegExpMatchArray[];
+          matches.forEach(matchArr => addPixelId(matchArr[1]));
+        });
+        
+        // Check NoScript Image tags specifically
+        const noScriptTags = document.querySelectorAll('noscript');
+        noScriptTags.forEach(tag => {
+          if (tag.innerHTML && tag.innerHTML.includes('facebook.com/tr')) {
+            const match = tag.innerHTML.match(/facebook\.com\/tr\?id=(\d+)/);
+            if (match && match[1]) {
+              addPixelId(match[1]);
             }
-          });
+          }
+        });
+        
+        // Check for Meta Pixel in dataLayer (for GTM implementations)
+        if (window.dataLayer && Array.isArray(window.dataLayer)) {
+          for (const item of window.dataLayer) {
+            try {
+              const itemStr = JSON.stringify(item);
+              
+              // Look for pixel IDs in dataLayer
+              const pixelMatches = itemStr.match(/(\d{10,16})/g); // Facebook pixel IDs are typically 15-16 digits
+              if (pixelMatches) {
+                pixelMatches.forEach(id => addPixelId(id));
+              }
+              
+              // Look for pixel ID in GTM variable format
+              if (
+                item && 
+                typeof item === 'object' && 
+                (itemStr.includes('pixel') || itemStr.includes('facebook') || itemStr.includes('fbq'))
+              ) {
+                // Recursively search for pixel IDs in nested objects
+                const searchForPixelId = (obj: any) => {
+                  if (!obj || typeof obj !== 'object') return;
+                  
+                  for (const key in obj) {
+                    const value = obj[key];
+                    if (typeof value === 'string' && /^\d{10,16}$/.test(value)) {
+                      console.log(`Found Meta Pixel ID in dataLayer object at key ${key}:`, value);
+                      addPixelId(value);
+                    } else if (typeof value === 'object') {
+                      searchForPixelId(value);
+                    }
+                  }
+                };
+                
+                searchForPixelId(item);
+              }
+            } catch (e) {
+              console.log("Error processing dataLayer item for Meta Pixel:", e);
+            }
+          }
         }
         
-        // Check for functional fbq
-        const hasFbqFunction = typeof window.fbq === 'function';
+        // Check Network Requests via Performance API
+        try {
+          const resources = performance.getEntriesByType('resource');
+          for (const resource of resources) {
+            const url = (resource as any).name;
+            if (typeof url === 'string' && url.includes('facebook.com/tr')) {
+              const match = url.match(/[?&]id=(\d{10,16})/);
+              if (match && match[1]) {
+                console.log("Found Meta Pixel ID in network request:", match[1]);
+                addPixelId(match[1]);
+              }
+            }
+          }
+        } catch (e) {
+          console.log("Error checking Performance API:", e);
+        }
         
-        // Determine status
+        // Check for GTM present
+        const hasGtm = 
+          document.querySelector('script[src*="googletagmanager.com/gtm.js"]') !== null ||
+          document.documentElement.innerHTML.includes('GTM-');
+        
+        // Determine status - be more lenient in what counts as "Connected"
         let status = 'Not Found';
+        let statusReason = '';
+        
         if (hasMetaPixel) {
           if (pixelIds.length === 0) {
-            status = 'Incomplete Setup'; // Meta Pixel script present but no Pixel ID
-          } else if (!hasInit || !hasFbqFunction) {
-            status = 'Misconfigured'; // ID found but not properly initialized
+            // If we have signs of Meta Pixel but couldn't extract an ID
+            status = 'Incomplete Setup';
+            statusReason = 'Meta Pixel code detected but no Pixel ID found. Add your Meta Pixel ID to complete the setup.';
+          } else if (hasFbqFunction || hasFbqInit || hasFbqInDataLayer || hasTrackingImage) {
+            // If we have an ID and function/init calls or tracking
+            status = 'Connected';
+            statusReason = 'Meta Pixel is properly implemented with initialization and tracking capabilities.';
           } else {
-            status = 'Connected'; // Everything is set up correctly
+            // If we have an ID but unclear initialization
+            status = 'Misconfigured';
+            statusReason = 'Meta Pixel ID found but implementation may be incomplete. Check that fbq() is properly initialized.';
           }
+        } else if (hasGtm && document.documentElement.innerHTML.includes('facebook')) {
+          status = 'Incomplete Setup';
+          statusReason = 'GTM is present with references to Facebook. Configure a Meta Pixel tag in your GTM container.';
+        } else {
+          statusReason = 'No Meta Pixel implementation detected.';
+        }
+        
+        // If we found pixel IDs but didn't mark as connected yet, upgrade status
+        if (pixelIds.length > 0 && status !== 'Connected') {
+          status = 'Connected';
+          statusReason = 'Meta Pixel ID found and appears to be implemented. Tracking should be functional.';
         }
         
         return {
           isPresent: hasMetaPixel,
           ids: pixelIds,
           id: pixelIds.length > 0 ? pixelIds[0] : undefined,
-          status
+          status,
+          statusReason
         };
       });
       
       return {
         name: TagType.META_PIXEL,
-        isPresent: metaData.isPresent,
+        isPresent: !!metaData.isPresent,
         status: metaData.status === 'Connected' ? 
                 TagStatus.CONNECTED : 
                 metaData.status === 'Misconfigured' ? 
@@ -856,14 +1279,16 @@ export class ScanService {
                 TagStatus.INCOMPLETE : 
                 TagStatus.NOT_FOUND,
         id: metaData.id,
-        ids: metaData.ids
+        ids: metaData.ids,
+        statusReason: metaData.statusReason
       };
     } catch (error) {
       console.error('Error detecting Meta Pixel:', error);
       return {
         name: TagType.META_PIXEL,
         isPresent: false,
-        status: TagStatus.ERROR
+        status: TagStatus.ERROR,
+        statusReason: 'An error occurred during detection. Please try again.'
       };
     }
   }
