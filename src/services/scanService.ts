@@ -103,6 +103,8 @@ export class ScanService {
       const ga4Requests: Set<string> = new Set();
       // Also monitor for Google Ads requests
       const googleAdsRequests: Set<string> = new Set();
+      // Add monitoring for GTM requests
+      const gtmRequests: Set<string> = new Set();
       
       // Remove any existing listeners to prevent duplicates
       await page.removeAllListeners('request');
@@ -110,6 +112,43 @@ export class ScanService {
       // Add new request listener
       page.on('request', request => {
         const url = request.url();
+        
+        // Check for GTM-related requests
+        if (url.includes('googletagmanager.com')) {
+          console.log("Detected potential GTM URL:", url);
+          
+          // Extract GTM ID from standard patterns
+          const gtmIdMatch = url.match(/GTM-[A-Z0-9]+/);
+          if (gtmIdMatch) {
+            console.log("Detected GTM in network request:", gtmIdMatch[0]);
+            gtmRequests.add(gtmIdMatch[0]);
+          }
+          
+          // Extract GTM from gtm parameter in URLs like googletagmanager.com/gtag/destination
+          if (url.includes('googletagmanager.com/gtag/destination')) {
+            console.log("Found googletagmanager.com/gtag/destination URL:", url);
+            
+            // Extract gtm parameter which indicates GTM is active
+            const gtmParamMatch = url.match(/[?&]gtm=([^&]+)/);
+            if (gtmParamMatch && gtmParamMatch[1]) {
+              console.log("Detected GTM parameter in network request:", gtmParamMatch[1]);
+              // Store the gtm parameter - useful for debugging and identifying GTM presence
+              gtmRequests.add(`GTM-PARAM:${gtmParamMatch[1]}`);
+            }
+            
+            // Also check for MC- format IDs which are related to GTM
+            const mcIdMatch = url.match(/[?&]id=MC-[A-Z0-9]+/);
+            if (mcIdMatch) {
+              const mcId = mcIdMatch[0].replace(/[?&]id=/, '');
+              console.log("Detected MC ID in GTM network request:", mcId);
+              gtmRequests.add(mcId);
+            }
+            
+            // If we've found a destination URL, we can be confident GTM is present
+            // Add a marker to indicate a destination request was found
+            gtmRequests.add('GTM-DETECTED-VIA-DESTINATION');
+          }
+        }
         
         // Check for GA4-related requests
         if (url.includes('google-analytics.com/g/collect') || 
@@ -160,6 +199,9 @@ export class ScanService {
           }
         }
       });
+      
+      // Attach the GTM requests to the page for later use
+      (page as any).gtmRequests = gtmRequests;
       
       // Clear browser cache and cookies before navigation
       const client = await page.target().createCDPSession();
@@ -319,8 +361,11 @@ export class ScanService {
   private async detectTags(page: Page, ga4Requests: string[], googleAdsRequests: string[]): Promise<TagResult[]> {
     const results: TagResult[] = [];
     
+    // Get GTM network requests - ensure proper typing
+    const gtmNetworkRequests = Array.from((page as any).gtmRequests || new Set<string>()) as string[];
+    
     // Detect Google Tag Manager
-    const gtmResult = await this.detectGoogleTagManager(page);
+    const gtmResult = await this.detectGoogleTagManager(page, gtmNetworkRequests);
     results.push(gtmResult);
     
     // Detect GA4
@@ -349,12 +394,18 @@ export class ScanService {
   /**
    * Detects Google Tag Manager
    */
-  private async detectGoogleTagManager(page: Page): Promise<TagResult> {
+  private async detectGoogleTagManager(page: Page, gtmNetworkRequests: string[] = []): Promise<TagResult> {
     try {
+      // Log any GTM IDs found in network requests
+      if (gtmNetworkRequests.length > 0) {
+        console.log("GTM data found in network requests:", gtmNetworkRequests);
+      }
+      
       // Check for GTM script and dataLayer
-      const gtmData = await page.evaluate(() => {
+      const gtmData = await page.evaluate((networkIds) => {
         // Log for debugging
         console.log("Starting GTM detection...");
+        console.log("Network GTM IDs:", networkIds);
         
         // Check for GTM script tag
         const hasGtmScript = document.querySelectorAll('script[src*="googletagmanager.com/gtm.js"]').length > 0 || 
@@ -367,8 +418,9 @@ export class ScanService {
         const hasGtmInitFunction = document.documentElement.innerHTML.includes('(window,document,\'script\',\'dataLayer\',\'GTM-') ||
                                   document.documentElement.innerHTML.includes('(window,document,"script","dataLayer","GTM-');
         
-        // Overall GTM presence
-        const hasGtm = hasGtmScript || hasGtmInit || hasGtmInitFunction;
+        // Overall GTM presence - now includes network detection
+        const hasNetworkGtm = networkIds.length > 0;
+        const hasGtm = hasGtmScript || hasGtmInit || hasGtmInitFunction || hasNetworkGtm;
         
         // Check for dataLayer
         const hasDataLayer = typeof window.dataLayer !== "undefined" && Array.isArray(window.dataLayer);
@@ -415,8 +467,9 @@ export class ScanService {
           }
         }
         
-        // Get GTM IDs if present
-        const gtmIds: string[] = [];
+        // Get GTM IDs if present - starting with network-based IDs
+        const gtmIds: string[] = [...networkIds.filter(id => id.startsWith('GTM-'))];
+        
         if (hasGtm || hasShopifyGtm) {
           // Find scripts with GTM initialization
           const scripts = Array.from(document.querySelectorAll('script'));
@@ -478,15 +531,34 @@ export class ScanService {
           }
         }
         
+        // Also add any special format IDs from network requests that are prefixed
+        const mcIds = networkIds.filter(id => id.startsWith('MC-'));
+        if (mcIds.length > 0) {
+          console.log("Found MC-format IDs related to GTM:", mcIds);
+        }
+        
+        // Check for network identified GTM through parameters
+        const hasGtmParams = networkIds.some(id => id.startsWith('GTM-PARAM:'));
+        if (hasGtmParams) {
+          const gtmParams = networkIds.filter(id => id.startsWith('GTM-PARAM:'));
+          console.log("GTM parameters detected in network requests:", gtmParams);
+        }
+        
+        // Check for a destination URL being detected
+        const hasDestinationRequest = networkIds.includes('GTM-DETECTED-VIA-DESTINATION');
+        if (hasDestinationRequest) {
+          console.log("GTM detected via googletagmanager.com/gtag/destination URL");
+        }
+        
         // Determine status based on GTM script and dataLayer presence - more lenient
         let status = 'Not Found';
         let statusReason = '';
         
-        if (hasGtm || hasShopifyGtm || hasActiveDataLayer) {
-          if (gtmIds.length === 0 && !hasShopifyGtm) {
+        if (hasNetworkGtm || hasGtm || hasShopifyGtm || hasActiveDataLayer) {
+          if ((gtmIds.length === 0 && !hasShopifyGtm) && !hasNetworkGtm && !mcIds.length && !hasDestinationRequest && !hasGtmParams) {
             status = 'Incomplete Setup'; // Script present but no GTM ID found
             statusReason = 'GTM script detected but no GTM-XXXXX ID found. Make sure your GTM container ID is properly configured.';
-          } else if (!hasDataLayer && !hasGtmActivation && !hasShopifyGtm) {
+          } else if (!hasDataLayer && !hasGtmActivation && !hasShopifyGtm && !hasNetworkGtm && !hasDestinationRequest && !hasGtmParams) {
             status = 'Misconfigured'; // Script and ID present but no dataLayer or activation
             statusReason = 'GTM ID found but dataLayer is missing or not properly initialized. Check that dataLayer is declared before GTM loads.';
           } else {
@@ -503,16 +575,33 @@ export class ScanService {
           statusReason = 'GTM detected through Shopify-specific implementation.';
         }
         
+        // If network requests indicate GTM activity, mark as connected
+        if ((hasNetworkGtm || hasDestinationRequest || hasGtmParams || mcIds.length > 0) && status !== 'Connected') {
+          status = 'Connected';
+          statusReason = hasDestinationRequest ? 'GTM detected through destination URL activity.' : 
+                         mcIds.length > 0 ? 'GTM detected through MC format IDs.' :
+                         hasGtmParams ? 'GTM detected through GTM parameters in network requests.' :
+                         'GTM detected through network activity.';
+        }
+        
+        // Include MC- IDs in the response if found
+        if (mcIds.length > 0) {
+          gtmIds.push(...mcIds);
+        }
+        
         return {
-          isPresent: hasGtm || hasShopifyGtm || hasActiveDataLayer,
+          isPresent: hasGtm || hasShopifyGtm || hasActiveDataLayer || hasNetworkGtm || hasDestinationRequest || hasGtmParams || mcIds.length > 0,
           ids: gtmIds,
           id: gtmIds.length > 0 ? gtmIds[0] : undefined,
           status,
           statusReason,
           hasDataLayer,
-          hasActiveEvents: hasGtmActivation || hasShopifyGtm
+          hasActiveEvents: hasGtmActivation || hasShopifyGtm || hasNetworkGtm || hasDestinationRequest || hasGtmParams,
+          mcIds: mcIds,
+          detectedViaDestination: hasDestinationRequest,
+          gtmParameters: hasGtmParams ? networkIds.filter(id => id.startsWith('GTM-PARAM:')) : []
         };
-      });
+      }, gtmNetworkRequests);
       
       return {
         name: TagType.GOOGLE_TAG_MANAGER,
@@ -528,7 +617,10 @@ export class ScanService {
         ids: gtmData.ids,
         details: gtmData.status,
         dataLayer: gtmData.hasDataLayer,
-        statusReason: gtmData.statusReason
+        statusReason: gtmData.statusReason,
+        detectedViaDestination: gtmData.detectedViaDestination,
+        gtmParameters: gtmData.gtmParameters,
+        mcIds: gtmData.mcIds
       };
     } catch (error) {
       console.error('Error detecting Google Tag Manager:', error);
