@@ -30,13 +30,16 @@ export class ScanService {
   private async getBrowser(): Promise<Browser> {
     if (!this.browser || !this.browser.isConnected()) {
       this.browser = await puppeteer.launch({
-        headless: true,
+        headless: "new",
         args: [
           '--no-sandbox', 
           '--disable-setuid-sandbox', 
           '--disable-dev-shm-usage',
           '--disable-features=IsolateOrigins,site-per-process',
-          '--disable-web-security'
+          '--disable-web-security',
+          '--enable-features=NetworkService',
+          '--allow-running-insecure-content',
+          '--disable-blink-features=AutomationControlled'
         ],
         defaultViewport: {
           width: 1366,
@@ -105,6 +108,8 @@ export class ScanService {
       const googleAdsRequests: Set<string> = new Set();
       // Add monitoring for GTM requests
       const gtmRequests: Set<string> = new Set();
+      // Add monitoring for Meta Pixel requests
+      const metaPixelRequests: Set<string> = new Set();
       
       // Remove any existing listeners to prevent duplicates
       await page.removeAllListeners('request');
@@ -112,6 +117,25 @@ export class ScanService {
       // Add new request listener
       page.on('request', request => {
         const url = request.url();
+        
+        // Check for Meta Pixel requests
+        if (url.includes('facebook.com/tr') || 
+            url.includes('connect.facebook.net') ||
+            url.includes('fbevents.js')) {
+          console.log("Detected potential Meta Pixel URL:", url);
+          
+          // Extract Meta Pixel ID from URL
+          const pixelIdMatch = url.match(/[?&]id=(\d{10,16})/);
+          if (pixelIdMatch && pixelIdMatch[1]) {
+            console.log("Detected Meta Pixel ID in network request:", pixelIdMatch[1]);
+            metaPixelRequests.add(pixelIdMatch[1]);
+          }
+          
+          // Even without an ID, record that we saw Meta Pixel activity
+          if (!pixelIdMatch) {
+            metaPixelRequests.add('META_PIXEL_DETECTED_VIA_NETWORK');
+          }
+        }
         
         // Check for GTM-related requests
         if (url.includes('googletagmanager.com')) {
@@ -203,6 +227,9 @@ export class ScanService {
       // Attach the GTM requests to the page for later use
       (page as any).gtmRequests = gtmRequests;
       
+      // Attach the Meta Pixel requests to the page
+      (page as any).metaPixelRequests = metaPixelRequests;
+      
       // Clear browser cache and cookies before navigation
       const client = await page.target().createCDPSession();
       await client.send('Network.clearBrowserCache');
@@ -210,6 +237,18 @@ export class ScanService {
       
       // Set a completely new context for each visit
       await page.setCacheEnabled(false);
+      
+      // More thorough context cleaning
+      await client.send('Storage.clearDataForOrigin', {
+        origin: '*',
+        storageTypes: 'all',
+      });
+      
+      // Ensure JavaScript is properly enabled and cookies accepted
+      await page.evaluateOnNewDocument(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+      });
       
       console.log("Starting scan with fresh browser context...");
       
@@ -245,11 +284,11 @@ export class ScanService {
       
       // Wait for dynamic tags to load
       console.log("Waiting for dynamic tags to load...");
-      await new Promise(resolve => setTimeout(resolve, 10000));
+      await new Promise(resolve => setTimeout(resolve, 15000));
       
       // Wait for any remaining network activity to settle
       try {
-        await page.waitForNetworkIdle({ idleTime: 2000, timeout: 5000 }).catch(() => {
+        await page.waitForNetworkIdle({ idleTime: 3000, timeout: 10000 }).catch(() => {
           console.log("Network activity timeout - continuing with scan");
         });
       } catch (e) {
@@ -364,6 +403,9 @@ export class ScanService {
     // Get GTM network requests - ensure proper typing
     const gtmNetworkRequests = Array.from((page as any).gtmRequests || new Set<string>()) as string[];
     
+    // Get Meta Pixel network requests
+    const metaPixelNetworkRequests = Array.from((page as any).metaPixelRequests || new Set<string>()) as string[];
+    
     // Detect Google Tag Manager
     const gtmResult = await this.detectGoogleTagManager(page, gtmNetworkRequests);
     results.push(gtmResult);
@@ -377,7 +419,7 @@ export class ScanService {
     results.push(gadsResult);
     
     // Detect Meta Pixel
-    const metaResult = await this.detectMetaPixel(page);
+    const metaResult = await this.detectMetaPixel(page, metaPixelNetworkRequests);
     results.push(metaResult);
     
     // // Detect LinkedIn Insight
@@ -1066,10 +1108,16 @@ export class ScanService {
   /**
    * Detects Meta (Facebook) Pixel
    */
-  private async detectMetaPixel(page: Page): Promise<TagResult> {
+  private async detectMetaPixel(page: Page, metaPixelNetworkRequests: string[] = []): Promise<TagResult> {
     try {
-      const metaData = await page.evaluate(() => {
+      // Log any Meta Pixel IDs found in network requests
+      if (metaPixelNetworkRequests.length > 0) {
+        console.log("Meta Pixel data found in network requests:", metaPixelNetworkRequests);
+      }
+      
+      const metaData = await page.evaluate((networkIds) => {
         console.log("Starting Meta Pixel detection...");
+        console.log("Network Meta Pixel IDs:", networkIds);
         
         // Check for Meta Pixel scripts - more comprehensive patterns
         const hasMetaPixelScript = 
@@ -1108,212 +1156,14 @@ export class ScanService {
                             (document.documentElement.innerHTML.includes('FB.init') || 
                              document.documentElement.innerHTML.includes('fbAsyncInit'));
         
+        // Network detection
+        const hasNetworkPixel = networkIds.length > 0;
+        
         // Build a more comprehensive check for Meta Pixel presence
-        const hasMetaPixel = hasMetaPixelScript || hasFbqFunction || hasFbqInit || hasFbqInDataLayer || hasTrackingImage || hasFBConnect;
+        const hasMetaPixel = hasMetaPixelScript || hasFbqFunction || hasFbqInit || hasFbqInDataLayer || hasTrackingImage || hasFBConnect || hasNetworkPixel;
         
-        // Array to store all Meta Pixel IDs
-        const pixelIds: string[] = [];
-        
-        // Function to extract pixel ID and add it to the array
-        const addPixelId = (id: string) => {
-          // Clean up the ID - remove any non-digit characters
-          const cleanId = id.replace(/\D/g, '');
-          // Most Facebook pixel IDs are 15-16 digits long
-          if (cleanId && /^\d{10,16}$/.test(cleanId) && !pixelIds.includes(cleanId)) {
-            pixelIds.push(cleanId);
-          }
-        };
-        
-        // Check for global variables that might hold pixel ID
-        try {
-          // Many sites store the pixel ID in a global variable
-          for (const key in window) {
-            if (
-              key.toLowerCase().includes('pixel') || 
-              key.toLowerCase().includes('facebook') || 
-              key.toLowerCase().includes('meta') || 
-              key.toLowerCase().includes('fb')
-            ) {
-              const value = (window as any)[key];
-              if (typeof value === 'string' && /^\d{10,16}$/.test(value)) {
-                console.log(`Found Meta Pixel ID in global variable ${key}:`, value);
-                addPixelId(value);
-              }
-            }
-          }
-        } catch (e) {
-          console.log("Error checking global variables:", e);
-        }
-        
-        // Check for fbq('init', 'XXXXXXXXXX') calls with more patterns
-        const scripts = Array.from(document.querySelectorAll('script'));
-        for (const script of scripts) {
-          const scriptContent = script.textContent || '';
-          if (scriptContent) {
-            // Regular fbq init calls with single quotes
-            const fbqSingleQuoteMatches = Array.from(scriptContent.matchAll(/fbq\s*\(\s*'init'\s*,\s*'(\d+)'/g) || []) as RegExpMatchArray[];
-            fbqSingleQuoteMatches.forEach(matchArr => addPixelId(matchArr[1]));
-            
-            // Regular fbq init calls with double quotes
-            const fbqDoubleQuoteMatches = Array.from(scriptContent.matchAll(/fbq\s*\(\s*"init"\s*,\s*"(\d+)"/g) || []) as RegExpMatchArray[];
-            fbqDoubleQuoteMatches.forEach(matchArr => addPixelId(matchArr[1]));
-            
-            // Legacy _fbq.push init calls
-            const fbqPushMatches = Array.from(scriptContent.matchAll(/_fbq\s*\.\s*push\s*\(\s*\[\s*['"]init['"],\s*['"](\d+)['"]/g) || []) as RegExpMatchArray[];
-            fbqPushMatches.forEach(matchArr => addPixelId(matchArr[1]));
-            
-            // Check for Facebook Pixel ID in variables
-            const pixelIdVarMatches = Array.from(scriptContent.matchAll(/pixel_id\s*=\s*['"](\d+)['"]/g) || []) as RegExpMatchArray[];
-            pixelIdVarMatches.forEach(matchArr => addPixelId(matchArr[1]));
-            
-            // Check for other assignment patterns
-            const assignmentPatterns = [
-              /fbq\s*\.\s*queue\s*\.\s*push\s*\(\s*\[\s*['"]init['"],\s*['"](\d+)['"]/g,
-              /FB_PIXEL_ID\s*=\s*['"](\d+)['"]/g,
-              /facebook_pixel_id\s*=\s*['"](\d+)['"]/g,
-              /fbPixelId\s*[:=]\s*['"](\d+)['"]/g,
-              /pixelId\s*[:=]\s*['"](\d+)['"]/g,
-              /pixel_id\s*[:=]\s*['"](\d+)['"]/g,
-              /fbp\s*[:=]\s*['"](\d+)['"]/g,
-              /fbq\(['"]track['"],\s*['"]PageView['"],\s*\{.*?['"]id['"]\s*:\s*['"](\d+)['"]/g,
-              /pixelCode\s*[:=]\s*['"](\d+)['"]/g
-            ];
-            
-            assignmentPatterns.forEach(pattern => {
-              const matches = Array.from(scriptContent.matchAll(pattern) || []) as RegExpMatchArray[];
-              matches.forEach(matchArr => addPixelId(matchArr[1]));
-            });
-            
-            // Check for pixel events which may include the ID
-            const eventPatterns = [
-              /fbq\s*\(\s*['"]track['"],\s*.*?['"]\s*,\s*.*?['"]content_ids['"]\s*:\s*\[\s*['"](\d+)['"]/g,
-              /fbq\s*\(\s*['"]trackCustom['"],\s*.*?['"](\d+)['"]/g
-            ];
-            
-            eventPatterns.forEach(pattern => {
-              const matches = Array.from(scriptContent.matchAll(pattern) || []) as RegExpMatchArray[];
-              matches.forEach(matchArr => {
-                // Only add IDs that match the pixel ID pattern (to avoid product IDs)
-                if (/^\d{10,16}$/.test(matchArr[1])) {
-                  addPixelId(matchArr[1]);
-                }
-              });
-            });
-            
-            // Look for base64 encoded pixel implementations (used to bypass ad blockers)
-            if (scriptContent.includes('base64') || scriptContent.includes('atob')) {
-              try {
-                // Find possible base64 strings
-                const base64Matches = scriptContent.match(/['"]([A-Za-z0-9+/=]{20,})['"];?/g);
-                if (base64Matches) {
-                  for (const match of base64Matches) {
-                    try {
-                      // Extract the string within quotes
-                      const base64Content = match.replace(/['"]/g, '').replace(/;$/, '');
-                      // Try to decode it
-                      const decodedContent = atob(base64Content);
-                      // Check if it contains a pixel ID
-                      const pixelMatch = decodedContent.match(/(\d{10,16})/);
-                      if (pixelMatch) {
-                        console.log("Found pixel ID in base64 encoded content:", pixelMatch[1]);
-                        addPixelId(pixelMatch[1]);
-                      }
-                    } catch (e) {
-                      // Not valid base64, skip
-                    }
-                  }
-                }
-              } catch (e) {
-                console.log("Error processing base64 content:", e);
-              }
-            }
-          }
-        }
-        
-        // Full HTML scan for pixel IDs using multiple patterns
-        const pixelPatterns = [
-          /fbq\s*\(\s*['"]init['"]\s*,\s*['"](\d+)['"]/g,
-          /pixel_id\s*=\s*(\d+)/g,
-          /facebook\.com\/tr\?id=(\d+)/g,
-          /fbq\(['"]set['"],\s*['"]autoConfig['"],\s*true,\s*['"](\d+)['"]/g,
-          /fbq\(['"]init['"],\s*['"](\d+)['"]/g,
-          /id=(\d{10,16})/g,
-          /\?id=(\d{10,16})/g
-        ];
-        
-        pixelPatterns.forEach(pattern => {
-          const matches = Array.from(document.documentElement.innerHTML.matchAll(pattern) || []) as RegExpMatchArray[];
-          matches.forEach(matchArr => addPixelId(matchArr[1]));
-        });
-        
-        // Check NoScript Image tags specifically
-        const noScriptTags = document.querySelectorAll('noscript');
-        noScriptTags.forEach(tag => {
-          if (tag.innerHTML && tag.innerHTML.includes('facebook.com/tr')) {
-            const match = tag.innerHTML.match(/facebook\.com\/tr\?id=(\d+)/);
-            if (match && match[1]) {
-              addPixelId(match[1]);
-            }
-          }
-        });
-        
-        // Check for Meta Pixel in dataLayer (for GTM implementations)
-        if (window.dataLayer && Array.isArray(window.dataLayer)) {
-          for (const item of window.dataLayer) {
-            try {
-              const itemStr = JSON.stringify(item);
-              
-              // Look for pixel IDs in dataLayer
-              const pixelMatches = itemStr.match(/(\d{10,16})/g); // Facebook pixel IDs are typically 15-16 digits
-              if (pixelMatches) {
-                pixelMatches.forEach(id => addPixelId(id));
-              }
-              
-              // Look for pixel ID in GTM variable format
-              if (
-                item && 
-                typeof item === 'object' && 
-                (itemStr.includes('pixel') || itemStr.includes('facebook') || itemStr.includes('fbq'))
-              ) {
-                // Recursively search for pixel IDs in nested objects
-                const searchForPixelId = (obj: any) => {
-                  if (!obj || typeof obj !== 'object') return;
-                  
-                  for (const key in obj) {
-                    const value = obj[key];
-                    if (typeof value === 'string' && /^\d{10,16}$/.test(value)) {
-                      console.log(`Found Meta Pixel ID in dataLayer object at key ${key}:`, value);
-                      addPixelId(value);
-                    } else if (typeof value === 'object') {
-                      searchForPixelId(value);
-                    }
-                  }
-                };
-                
-                searchForPixelId(item);
-              }
-            } catch (e) {
-              console.log("Error processing dataLayer item for Meta Pixel:", e);
-            }
-          }
-        }
-        
-        // Check Network Requests via Performance API
-        try {
-          const resources = performance.getEntriesByType('resource');
-          for (const resource of resources) {
-            const url = (resource as any).name;
-            if (typeof url === 'string' && url.includes('facebook.com/tr')) {
-              const match = url.match(/[?&]id=(\d{10,16})/);
-              if (match && match[1]) {
-                console.log("Found Meta Pixel ID in network request:", match[1]);
-                addPixelId(match[1]);
-              }
-            }
-          }
-        } catch (e) {
-          console.log("Error checking Performance API:", e);
-        }
+        // Array to store all Meta Pixel IDs - starting with network IDs
+        const pixelIds: string[] = [...networkIds.filter(id => id !== 'META_PIXEL_DETECTED_VIA_NETWORK')];
         
         // Check for GTM present
         const hasGtm = 
@@ -1325,11 +1175,11 @@ export class ScanService {
         let statusReason = '';
         
         if (hasMetaPixel) {
-          if (pixelIds.length === 0) {
+          if (pixelIds.length === 0 && !hasNetworkPixel) {
             // If we have signs of Meta Pixel but couldn't extract an ID
             status = 'Incomplete Setup';
             statusReason = 'Meta Pixel code detected but no Pixel ID found. Add your Meta Pixel ID to complete the setup.';
-          } else if (hasFbqFunction || hasFbqInit || hasFbqInDataLayer || hasTrackingImage) {
+          } else if (hasFbqFunction || hasFbqInit || hasFbqInDataLayer || hasTrackingImage || hasNetworkPixel) {
             // If we have an ID and function/init calls or tracking
             status = 'Connected';
             statusReason = 'Meta Pixel is properly implemented with initialization and tracking capabilities.';
@@ -1351,14 +1201,21 @@ export class ScanService {
           statusReason = 'Meta Pixel ID found and appears to be implemented. Tracking should be functional.';
         }
         
+        // If we detected Meta Pixel via network requests but couldn't extract IDs
+        if (networkIds.includes('META_PIXEL_DETECTED_VIA_NETWORK') && status !== 'Connected') {
+          status = 'Connected';
+          statusReason = 'Meta Pixel detected through network requests. Tracking appears to be functional.';
+        }
+        
         return {
           isPresent: hasMetaPixel,
           ids: pixelIds,
           id: pixelIds.length > 0 ? pixelIds[0] : undefined,
           status,
-          statusReason
+          statusReason,
+          detectedViaNetwork: hasNetworkPixel
         };
-      });
+      }, metaPixelNetworkRequests);
       
       return {
         name: TagType.META_PIXEL,
@@ -1372,7 +1229,8 @@ export class ScanService {
                 TagStatus.NOT_FOUND,
         id: metaData.id,
         ids: metaData.ids,
-        statusReason: metaData.statusReason
+        statusReason: metaData.statusReason,
+        detectedViaNetwork: metaData.detectedViaNetwork
       };
     } catch (error) {
       console.error('Error detecting Meta Pixel:', error);
