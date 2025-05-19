@@ -15,6 +15,13 @@ declare global {
     google_conversion_label?: string;
     google_tag_params?: any;
     google_tag_manager?: any;
+    Shopify?: any;
+    wixBiSession?: any;
+    wixPerformance?: any;
+    wixEmbedsAPI?: any;
+    wp?: any;
+    wpApiSettings?: any;
+    wc?: any;
   }
 }
 
@@ -516,6 +523,7 @@ export class ScanService {
         
         // Check for dataLayer structure - Shopify often has Arguments objects in dataLayer
         let hasShopifyGtm = false;
+        let hasWixGtm = false;
         if (hasDataLayer && window.dataLayer) {
           // Look for typical Shopify GTM patterns
           for (const item of window.dataLayer) {
@@ -524,9 +532,26 @@ export class ScanService {
             if (itemStr.includes('Arguments') || 
                 (typeof item === 'object' && item.event === 'gtm.js') ||
                 (typeof item === 'object' && item.event === 'gtm.dom') ||
-                (typeof item === 'object' && item.event === 'gtm.load')) {
+                (typeof item === 'object' && item.event === 'gtm.load') ||
+                // Additional Shopify-specific patterns
+                itemStr.includes('Shopify') ||
+                itemStr.includes('shopify') ||
+                itemStr.includes('cart') ||
+                itemStr.includes('product_variant_id') ||
+                itemStr.includes('checkout') ||
+                (typeof item === 'object' && item.pageType && ['product', 'collection', 'cart', 'page'].includes(item.pageType))) {
               hasShopifyGtm = true;
               console.log("Detected Shopify-style GTM implementation");
+              break;
+            }
+            
+            // Look for Wix-specific patterns in dataLayer
+            if (itemStr.includes('wix') || 
+                itemStr.includes('Wix') || 
+                (typeof item === 'object' && item.siteName && typeof item.siteName === 'string' && item.siteName.includes('wixsite.com')) ||
+                (typeof item === 'object' && item.pageId && item.pageType)) {
+              hasWixGtm = true;
+              console.log("Detected Wix-style GTM implementation");
               break;
             }
           }
@@ -556,7 +581,7 @@ export class ScanService {
         // Get GTM IDs if present - starting with network-based IDs
         const gtmIds: string[] = [...networkIds.filter(id => id.startsWith('GTM-'))];
         
-        if (hasGtm || hasShopifyGtm) {
+        if (hasGtm || hasShopifyGtm || hasWixGtm) {
           // Find scripts with GTM initialization
           const scripts = Array.from(document.querySelectorAll('script'));
           for (const script of scripts) {
@@ -603,8 +628,8 @@ export class ScanService {
             }
           });
           
-          // Full HTML scan for GTM IDs if none found yet or for Shopify sites
-          if (gtmIds.length === 0 || hasShopifyGtm) {
+          // Full HTML scan for GTM IDs if none found yet or for Shopify/Wix sites
+          if (gtmIds.length === 0 || hasShopifyGtm || hasWixGtm) {
             const fullHtmlMatches = Array.from(document.documentElement.innerHTML.matchAll(/GTM-[A-Z0-9]+/g) || []) as RegExpMatchArray[];
             if (fullHtmlMatches.length > 0) {
               fullHtmlMatches.forEach(matchArr => {
@@ -640,11 +665,11 @@ export class ScanService {
         let status = 'Not Found';
         let statusReason = '';
         
-        if (hasNetworkGtm || hasGtm || hasShopifyGtm || hasActiveDataLayer) {
-          if ((gtmIds.length === 0 && !hasShopifyGtm) && !hasNetworkGtm && !mcIds.length && !hasDestinationRequest && !hasGtmParams) {
+        if (hasNetworkGtm || hasGtm || hasShopifyGtm || hasWixGtm || hasActiveDataLayer) {
+          if ((gtmIds.length === 0 && !hasShopifyGtm && !hasWixGtm) && !hasNetworkGtm && !mcIds.length && !hasDestinationRequest && !hasGtmParams) {
             status = 'Incomplete Setup'; // Script present but no GTM ID found
             statusReason = 'GTM script detected but no GTM-XXXXX ID found. Make sure your GTM container ID is properly configured.';
-          } else if (!hasDataLayer && !hasGtmActivation && !hasShopifyGtm && !hasNetworkGtm && !hasDestinationRequest && !hasGtmParams) {
+          } else if (!hasDataLayer && !hasGtmActivation && !hasShopifyGtm && !hasWixGtm && !hasNetworkGtm && !hasDestinationRequest && !hasGtmParams) {
             status = 'Misconfigured'; // Script and ID present but no dataLayer or activation
             statusReason = 'GTM ID found but dataLayer is missing or not properly initialized. Check that dataLayer is declared before GTM loads.';
           } else {
@@ -659,6 +684,12 @@ export class ScanService {
         if (hasShopifyGtm && hasActiveDataLayer && status !== 'Connected') {
           status = 'Connected';
           statusReason = 'GTM detected through Shopify-specific implementation.';
+        }
+        
+        // For Wix sites with active dataLayer but no visible GTM ID, mark as connected
+        if (hasWixGtm && hasActiveDataLayer && status !== 'Connected') {
+          status = 'Connected';
+          statusReason = 'GTM detected through Wix-specific implementation.';
         }
         
         // If network requests indicate GTM activity, mark as connected
@@ -676,13 +707,13 @@ export class ScanService {
         }
         
         return {
-          isPresent: hasGtm || hasShopifyGtm || hasActiveDataLayer || hasNetworkGtm || hasDestinationRequest || hasGtmParams || mcIds.length > 0,
+          isPresent: hasGtm || hasShopifyGtm || hasWixGtm || hasActiveDataLayer || hasNetworkGtm || hasDestinationRequest || hasGtmParams || mcIds.length > 0,
           ids: gtmIds,
           id: gtmIds.length > 0 ? gtmIds[0] : undefined,
           status,
           statusReason,
           hasDataLayer,
-          hasActiveEvents: hasGtmActivation || hasShopifyGtm || hasNetworkGtm || hasDestinationRequest || hasGtmParams,
+          hasActiveEvents: hasGtmActivation || hasShopifyGtm || hasWixGtm || hasNetworkGtm || hasDestinationRequest || hasGtmParams,
           mcIds: mcIds,
           detectedViaDestination: hasDestinationRequest,
           gtmParameters: hasGtmParams ? networkIds.filter(id => id.startsWith('GTM-PARAM:')) : []
@@ -1394,49 +1425,140 @@ export class ScanService {
         const html = document.documentElement.outerHTML;
         const metaTags = document.querySelectorAll('meta');
         
-        // WordPress detection
-        if (
-          html.includes('/wp-content/') || 
-          html.includes('/wp-includes/') || 
-          document.querySelector('link[href*="wp-"]') !== null
-        ) {
-          return { name: 'WordPress', confidence: 0.9 };
+        // Create confidence scoring system to better handle edge cases
+        let wordpressScore = 0;
+        let shopifyScore = 0;
+        let wixScore = 0;
+        
+        // WordPress detection - enhanced with more specific patterns
+        try {
+          // Check for unique WordPress indicators (high confidence)
+          if (
+            document.querySelector('link[href*="/wp-content/"]') !== null ||
+            document.querySelector('script[src*="/wp-includes/"]') !== null ||
+            document.querySelector('body.wp-admin') !== null ||
+            document.querySelector('#wpadminbar') !== null ||
+            document.querySelector('.wp-block-') !== null
+          ) {
+            wordpressScore += 3;
+          }
+          
+          // Check for WordPress-specific paths and strings (medium confidence)
+          if (
+            html.includes('/wp-content/') || 
+            html.includes('/wp-includes/') || 
+            html.includes('/wp-json/') ||
+            html.includes('wp-emoji') ||
+            document.querySelector('link[href*="wp-"]') !== null
+          ) {
+            wordpressScore += 2;
+          }
+          
+          // Check for WordPress global objects and functions
+          if (
+            typeof window.wp !== 'undefined' ||
+            typeof window.wpApiSettings !== 'undefined' ||
+            typeof window.wc !== 'undefined' || // WooCommerce
+            document.body.className.includes('wordpress')
+          ) {
+            wordpressScore += 3;
+          }
+          
+          // If score is very high, it's definitely WordPress
+          if (wordpressScore >= 5) {
+            return { name: 'WordPress', confidence: 0.95 };
+          }
+        } catch (e) {
+          console.log("Error in WordPress detection:", e);
         }
         
-        // Shopify detection
-        if (
-          html.includes('cdn.shopify.com') || 
-          html.includes('Shopify.theme')
-        ) {
-          return { name: 'Shopify', confidence: 0.9 };
+        // Shopify detection - add additional checks
+        try {
+          // High confidence Shopify indicators
+          if (
+            window.Shopify || 
+            html.includes('cdn.shopify.com') || 
+            html.includes('Shopify.theme')
+          ) {
+            shopifyScore += 3;
+          }
+          
+          // Medium confidence Shopify indicators
+          if (
+            html.includes('shopify-section') ||
+            html.includes('shopify-payment-button') ||
+            html.includes('/apps/checkout') ||
+            html.includes('myshopify.com') ||
+            html.includes('.myshopify.com') ||
+            document.querySelector('link[href*="shopify"]') !== null ||
+            document.querySelector('script[src*="shopify"]') !== null
+          ) {
+            shopifyScore += 2;
+          }
+          
+          // Lower confidence indicators
+          if (
+            html.includes('shopify-custom-currency') ||
+            html.includes('shopify-buy') ||
+            document.querySelector('.shopify-buy') !== null ||
+            document.querySelector('[data-shopify]') !== null
+          ) {
+            shopifyScore += 1;
+          }
+          
+          // If score is high enough, it's Shopify
+          if (shopifyScore >= 3) {
+            return { name: 'Shopify', confidence: 0.9 };
+          }
+        } catch (e) {
+          console.log("Error in Shopify detection:", e);
         }
         
-        // Wix detection
-        if (
-          html.includes('static.wixstatic.com') || 
-          html.includes('wix-') || 
-          document.querySelector('meta[name="generator"][content*="Wix"]') !== null
-        ) {
-          return { name: 'Wix', confidence: 0.9 };
+        // Wix detection - add additional checks
+        try {
+          // High confidence Wix indicators
+          if (
+            window.wixBiSession || 
+            window.wixPerformance ||
+            window.wixEmbedsAPI ||
+            html.includes('static.wixstatic.com')
+          ) {
+            wixScore += 3;
+          }
+          
+          // Medium confidence Wix indicators
+          if (
+            html.includes('X-Wix-') ||
+            html.includes('static.parastorage.com') ||
+            html.includes('wixsite.com') ||
+            html.includes('wixcode-') ||
+            document.querySelector('[data-mesh-id]') !== null
+          ) {
+            wixScore += 2;
+          }
+          
+          // Lower confidence indicators
+          if (
+            html.includes('wix-') ||
+            html.includes('wix-instantsearch') ||
+            html.includes('wix-dropdown') ||
+            document.querySelector('img[src*="wix"]') !== null ||
+            document.querySelector('[data-wix]') !== null ||
+            document.querySelector('[data-hook*="wix"]') !== null 
+          ) {
+            wixScore += 1;
+          }
+          
+          // If score is high enough, it's Wix
+          if (wixScore >= 3) {
+            return { name: 'Wix', confidence: 0.9 };
+          }
+        } catch (e) {
+          console.log("Error in Wix detection:", e);
         }
         
-        // Drupal detection
-        if (
-          html.includes('drupal.') || 
-          document.querySelector('meta[name="generator"][content*="Drupal"]') !== null
-        ) {
-          return { name: 'Drupal', confidence: 0.9 };
-        }
-        
-        // Joomla detection
-        if (
-          html.includes('/media/jui/') || 
-          document.querySelector('meta[name="generator"][content*="Joomla"]') !== null
-        ) {
-          return { name: 'Joomla', confidence: 0.9 };
-        }
-        
-        // Check meta generator tags for other CMS
+        // Only check meta generator tags if we haven't found a definitive match
+        // This helps prevent false positives because some sites have multiple meta generators
         for (const meta of metaTags) {
           if (meta.getAttribute('name') === 'generator') {
             const content = meta.getAttribute('content');
@@ -1456,9 +1578,56 @@ export class ScanService {
               if (content.includes('Webflow')) {
                 return { name: 'Webflow', confidence: 0.9 };
               }
-              return { name: content.split(' ')[0], confidence: 0.7 };
+              if (content.includes('Drupal')) {
+                return { name: 'Drupal', confidence: 0.9 };
+              }
+              if (content.includes('Joomla')) {
+                return { name: 'Joomla', confidence: 0.9 };
+              }
+              // For unknown generators, only return if we have a clear platform name
+              if (content.length > 0) {
+                const platformName = content.split(' ')[0];
+                if (platformName && platformName.length > 2) {
+                  return { name: platformName, confidence: 0.7 };
+                }
+              }
             }
           }
+        }
+        
+        // Check for Drupal specific indicators
+        if (
+          html.includes('drupal.') || 
+          html.includes('/sites/default/files/') ||
+          html.includes('/sites/all/') ||
+          html.includes('drupalSettings') ||
+          document.querySelector('body.path-frontpage') !== null
+        ) {
+          return { name: 'Drupal', confidence: 0.9 };
+        }
+        
+        // Check for Joomla specific indicators
+        if (
+          html.includes('/media/jui/') || 
+          html.includes('/media/system/') ||
+          html.includes('joomla') ||
+          html.includes('Joomla!')
+        ) {
+          return { name: 'Joomla', confidence: 0.9 };
+        }
+        
+        // If we have some WordPress indicators but not enough for a definitive match
+        if (wordpressScore > 0) {
+          return { name: 'WordPress', confidence: wordpressScore >= 2 ? 0.8 : 0.6 };
+        }
+        
+        // Return partial matches with lower confidence
+        if (shopifyScore > 0) {
+          return { name: 'Shopify', confidence: shopifyScore >= 2 ? 0.7 : 0.5 };
+        }
+        
+        if (wixScore > 0) {
+          return { name: 'Wix', confidence: wixScore >= 2 ? 0.7 : 0.5 };
         }
         
         return undefined;
