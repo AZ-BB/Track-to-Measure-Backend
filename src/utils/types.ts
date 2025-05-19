@@ -30,6 +30,10 @@ export interface TagResult {
   details?: string;
   dataLayer?: boolean;
   statusReason?: string;
+  // Additional GTM detection properties
+  detectedViaDestination?: boolean;
+  gtmParameters?: string[];
+  mcIds?: string[];
 }
 
 // Scan result interface
