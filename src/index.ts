@@ -51,7 +51,7 @@ app.use(globalErrorHandler)
 // Start server
 app.listen(port, () => {
   console.log(`Server running on port ${port}`)
-  // console.log(`Environment: ${process.env.NODE_ENV}`)
+  console.log(`Environment: ${process.env.NODE_ENV}`)
   // console.log(`Frontend URL: ${process.env.FRONTEND_URL}`)
 })
 
