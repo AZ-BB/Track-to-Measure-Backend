@@ -34,6 +34,8 @@ export interface TagResult {
   detectedViaDestination?: boolean;
   gtmParameters?: string[];
   mcIds?: string[];
+  // Meta Pixel network detection
+  detectedViaNetwork?: boolean;
 }
 
 // Scan result interface
