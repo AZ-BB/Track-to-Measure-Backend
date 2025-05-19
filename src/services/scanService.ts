@@ -51,6 +51,30 @@ export class ScanService {
   }
 
   /**
+   * Create a fresh browser instance for each scan
+   * This helps prevent state persistence issues between scans
+   */
+  private async createBrowser(): Promise<Browser> {
+    return await puppeteer.launch({
+      headless: "new",
+      args: [
+        '--no-sandbox', 
+        '--disable-setuid-sandbox', 
+        '--disable-dev-shm-usage',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--disable-web-security',
+        '--enable-features=NetworkService',
+        '--allow-running-insecure-content',
+        '--disable-blink-features=AutomationControlled'
+      ],
+      defaultViewport: {
+        width: 1366,
+        height: 768
+      }
+    });
+  }
+
+  /**
    * Get a random user agent to appear as a new visitor
    */
   private getRandomUserAgent(): string {
@@ -78,13 +102,14 @@ export class ScanService {
     }
     
     let page: Page | null = null;
+    let scanBrowser: Browser | null = null;
     
     try {
-      // Get or create browser instance
-      const browser = await this.getBrowser();
+      // Create a fresh browser instance for this scan
+      scanBrowser = await this.createBrowser();
       
       // Create a new page
-      page = await browser.newPage();
+      page = await scanBrowser.newPage();
       
       // Set random user agent to appear as a new visitor each time
       await page.setUserAgent(this.getRandomUserAgent());
@@ -360,6 +385,15 @@ export class ScanService {
         page = null;
       }
       
+      // Close the browser instance created for this scan
+      if (scanBrowser) {
+        try {
+          await scanBrowser.close();
+        } catch (closeError) {
+          console.error('Error closing browser instance:', closeError);
+        }
+      }
+      
       // Return scan result
       return {
         url: normalizedUrl,
@@ -380,6 +414,16 @@ export class ScanService {
           console.error('Error closing page:', closeError);
         }
       }
+      
+      // Make sure to close the browser instance in case of error
+      if (scanBrowser) {
+        try {
+          await scanBrowser.close();
+        } catch (closeError) {
+          console.error('Error closing browser instance:', closeError);
+        }
+      }
+      
       throw new BadRequest(`Failed to scan URL: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
