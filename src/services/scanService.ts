@@ -156,15 +156,27 @@ export class ScanService {
             url.includes('fbevents.js')) {
           console.log("Detected potential Meta Pixel URL:", url);
           
-          // Extract Meta Pixel ID from URL
-          const pixelIdMatch = url.match(/[?&]id=(\d{10,16})/);
-          if (pixelIdMatch && pixelIdMatch[1]) {
-            console.log("Detected Meta Pixel ID in network request:", pixelIdMatch[1]);
-            metaPixelRequests.add(pixelIdMatch[1]);
+          // Extract Meta Pixel ID from URL with enhanced patterns
+          const pixelIdPatterns = [
+            /[?&]id=(\d{10,16})/,
+            /\/tr\?id=(\d{10,16})/,
+            /pixel_id[=:](\d{10,16})/,
+            /pixelId[=:](\d{10,16})/
+          ];
+          
+          let pixelIdFound = false;
+          for (const pattern of pixelIdPatterns) {
+            const pixelIdMatch = url.match(pattern);
+            if (pixelIdMatch && pixelIdMatch[1]) {
+              console.log("Detected Meta Pixel ID in network request:", pixelIdMatch[1]);
+              metaPixelRequests.add(pixelIdMatch[1]);
+              pixelIdFound = true;
+              break;
+            }
           }
           
           // Even without an ID, record that we saw Meta Pixel activity
-          if (!pixelIdMatch) {
+          if (!pixelIdFound) {
             metaPixelRequests.add('META_PIXEL_DETECTED_VIA_NETWORK');
           }
         }
@@ -925,23 +937,23 @@ export class ScanService {
             statusReason = 'GA4 tracking ID found in the page code.';
           }
           console.log("GA4 status: Connected with IDs:", ga4Ids);
-        } else if (hasGa4Script) {
-          // If we see GA4 script or GTM with analytics references, it's at least incomplete
+        } else if (hasGa4Script && ga4Ids.length === 0) {
+          // If we see GA4 script but no measurement ID, it's incomplete setup
           status = 'Incomplete Setup';
           statusReason = 'GA4 script detected but no measurement ID (G-XXXXXXXX) found. Add your GA4 measurement ID to complete the setup.';
           console.log("GA4 status: Incomplete Setup (script present but no IDs)");
-        } else if (hasGtm) {
-          // If GTM is present but we don't see GA4 directly
-          status = 'Incomplete Setup';
-          statusReason = 'Google Tag Manager detected but no GA4 configuration found. Add a GA4 tag in your GTM container.';
-          console.log("GA4 status adjusted to Incomplete Setup due to GTM presence");
+        } else if (hasGtm && document.documentElement.innerHTML.includes('google-analytics')) {
+          // If GTM is present with analytics references but no GA4 found
+          status = 'Not Found';
+          statusReason = 'No GA4 implementation detected';
+          console.log("GA4 status adjusted to Incomplete Setup due to GTM with analytics references");
         } else {
           statusReason = 'No Google Analytics 4 implementation detected.';
           console.log("GA4 status: Not Found");
         }
         
         return {
-          isPresent: ga4Ids.length > 0 || hasGa4Script || (status !== 'Not Found'),
+          isPresent: ga4Ids.length > 0 || hasGa4Script || networkIds.length > 0,
           ids: ga4Ids,
           id: ga4Ids.length > 0 ? ga4Ids[0] : undefined,
           status,
@@ -1240,50 +1252,97 @@ export class ScanService {
         // Array to store all Meta Pixel IDs - starting with network IDs
         const pixelIds: string[] = [...networkIds.filter(id => id !== 'META_PIXEL_DETECTED_VIA_NETWORK')];
         
+        // Enhanced pixel ID extraction from HTML content
+        try {
+          const htmlContent = document.documentElement.innerHTML;
+          
+          // Look for pixel IDs in various formats
+          const pixelPatterns = [
+            /fbq\(['"]init['"],\s*['"](\d{10,16})['"]/g,
+            /fbq\("init",\s*"(\d{10,16})"/g,
+            /fbq\('init',\s*'(\d{10,16})'/g,
+            /_fbq\.push\(\['init',\s*'(\d{10,16})'\]/g,
+            /facebook\.com\/tr\?id=(\d{10,16})/g,
+            /pixel_id['"]\s*:\s*['"](\d{10,16})['"]/g,
+            /pixelId['"]\s*:\s*['"](\d{10,16})['"]/g,
+            /"pixel_id"\s*:\s*"(\d{10,16})"/g,
+            /"pixelId"\s*:\s*"(\d{10,16})"/g,
+            /id=(\d{10,16})[^0-9]/g
+          ];
+          
+          for (const pattern of pixelPatterns) {
+            const matches = Array.from(htmlContent.matchAll(pattern));
+            if (matches.length > 0) {
+              matches.forEach(match => {
+                const pixelId = match[1];
+                if (pixelId && !pixelIds.includes(pixelId)) {
+                  console.log("Found Meta Pixel ID in HTML content:", pixelId);
+                  pixelIds.push(pixelId);
+                }
+              });
+            }
+          }
+          
+          // Check individual script tags for pixel IDs
+          const scripts = Array.from(document.querySelectorAll('script'));
+          for (const script of scripts) {
+            if (script.textContent) {
+              for (const pattern of pixelPatterns) {
+                const matches = Array.from(script.textContent.matchAll(pattern));
+                if (matches.length > 0) {
+                  matches.forEach(match => {
+                    const pixelId = match[1];
+                    if (pixelId && !pixelIds.includes(pixelId)) {
+                      console.log("Found Meta Pixel ID in script tag:", pixelId);
+                      pixelIds.push(pixelId);
+                    }
+                  });
+                }
+              }
+            }
+          }
+          
+          // Check noscript tags for tracking pixels
+          const noscripts = Array.from(document.querySelectorAll('noscript'));
+          for (const noscript of noscripts) {
+            if (noscript.innerHTML) {
+              const pixelMatch = noscript.innerHTML.match(/facebook\.com\/tr\?id=(\d{10,16})/);
+              if (pixelMatch && pixelMatch[1] && !pixelIds.includes(pixelMatch[1])) {
+                console.log("Found Meta Pixel ID in noscript tag:", pixelMatch[1]);
+                pixelIds.push(pixelMatch[1]);
+              }
+            }
+          }
+          
+        } catch (e) {
+          console.log("Error extracting pixel IDs from HTML:", e);
+        }
+        
         // Check for GTM present
         const hasGtm = 
           document.querySelector('script[src*="googletagmanager.com/gtm.js"]') !== null ||
           document.documentElement.innerHTML.includes('GTM-');
         
-        // Determine status - be more lenient in what counts as "Connected"
+        // Determine status - simplified to only show Connected or Not Found
         let status = 'Not Found';
         let statusReason = '';
         
         if (hasMetaPixel) {
-          if (pixelIds.length === 0 && !hasNetworkPixel) {
-            // If we have signs of Meta Pixel but couldn't extract an ID
-            status = 'Incomplete Setup';
-            statusReason = 'Meta Pixel code detected but no Pixel ID found. Add your Meta Pixel ID to complete the setup.';
-          } else if (hasFbqFunction || hasFbqInit || hasFbqInDataLayer || hasTrackingImage || hasNetworkPixel) {
-            // If we have an ID and function/init calls or tracking
+          // If we have Meta Pixel indicators and either have IDs or network detection
+          if (pixelIds.length > 0 || hasNetworkPixel || hasFbqFunction || hasFbqInit || hasFbqInDataLayer || hasTrackingImage) {
             status = 'Connected';
-            statusReason = 'Meta Pixel is properly implemented with initialization and tracking capabilities.';
+            statusReason = 'Meta Pixel is properly implemented and tracking appears to be functional.';
           } else {
-            // If we have an ID but unclear initialization
-            status = 'Misconfigured';
-            statusReason = 'Meta Pixel ID found but implementation may be incomplete. Check that fbq() is properly initialized.';
+            // If we have some indicators but not enough to confirm it's working
+            status = 'Not Found';
+            statusReason = 'No Meta Pixel implementation detected.';
           }
-        } else if (hasGtm && document.documentElement.innerHTML.includes('facebook')) {
-          status = 'Incomplete Setup';
-          statusReason = 'GTM is present with references to Facebook. Configure a Meta Pixel tag in your GTM container.';
         } else {
           statusReason = 'No Meta Pixel implementation detected.';
         }
         
-        // If we found pixel IDs but didn't mark as connected yet, upgrade status
-        if (pixelIds.length > 0 && status !== 'Connected') {
-          status = 'Connected';
-          statusReason = 'Meta Pixel ID found and appears to be implemented. Tracking should be functional.';
-        }
-        
-        // If we detected Meta Pixel via network requests but couldn't extract IDs
-        if (networkIds.includes('META_PIXEL_DETECTED_VIA_NETWORK') && status !== 'Connected') {
-          status = 'Connected';
-          statusReason = 'Meta Pixel detected through network requests. Tracking appears to be functional.';
-        }
-        
         return {
-          isPresent: hasMetaPixel,
+          isPresent: hasMetaPixel && (pixelIds.length > 0 || hasNetworkPixel || hasFbqFunction || hasFbqInit || hasFbqInDataLayer || hasTrackingImage),
           ids: pixelIds,
           id: pixelIds.length > 0 ? pixelIds[0] : undefined,
           status,
