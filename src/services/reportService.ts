@@ -1,6 +1,8 @@
 import PDFDocument from 'pdfkit';
 import { ScanResult, TagResult, ReportOptions } from '../utils/types';
 import BadRequest from '../middlewares/handlers/errors/BadRequest';
+import path from 'path';
+import fs from 'fs';
 
 /**
  * Service to generate PDF reports from scan results
@@ -302,7 +304,7 @@ export class ReportService {
     
     if (scanResult.cms) {
       // CMS detected with icon
-      this.drawTagIcon(doc, 'CMS', leftColumnX, startY + 30);
+      this.drawCMSIcon(doc, scanResult.cms, leftColumnX, startY + 30);
       doc.fontSize(13)
          .fillColor('#1F2937')
          .text(scanResult.cms, leftColumnX + 40, startY + 35);
@@ -385,66 +387,154 @@ export class ReportService {
   }
   
   /**
-   * Draws tag icons
+   * Helper method to get icon path with fallback logic
+   */
+  private getIconPath(folder: string, filename: string): string {
+    // Try multiple possible paths based on working directory structure
+    const possiblePaths = [
+      path.join(process.cwd(), 'Track-To-Measure', 'public', folder, filename),
+      path.join(process.cwd(), 'public', folder, filename),
+      path.join(__dirname, '../../Track-To-Measure/public', folder, filename),
+      path.join(__dirname, '../../../Track-To-Measure/public', folder, filename)
+    ];
+    
+    for (const testPath of possiblePaths) {
+      if (fs.existsSync(testPath)) {
+        return testPath;
+      }
+    }
+    
+    return ''; // Return empty if no path found
+  }
+
+  /**
+   * Draws tag icons using actual PNG/SVG files
    */
   private drawTagIcon(doc: PDFKit.PDFDocument, tagName: string, x: number, y: number) {
-    const iconSize = 32;
+    const iconSize = 24; // Reduced from 32
     
-    // Draw background circle/square for icon
-    doc.roundedRect(x, y, iconSize, iconSize, 4)
-       .fill('#F3F4F6');
-    
-    // Simple icon representations based on tag type
-    doc.fontSize(8)
-       .fillColor('#6B7280');
-       
-    switch (tagName) {
-      case 'Google Tag Manager':
-        // GTM icon - simple "G" representation
-        doc.circle(x + iconSize/2, y + iconSize/2, 12)
-           .fill('#4285F4')
-           .fontSize(12)
-           .fillColor('#FFFFFF')
-           .text('G', x + iconSize/2 - 4, y + iconSize/2 - 6);
-        break;
-      case 'GA4':
-        // GA4 icon - analytics chart representation
-        doc.rect(x + 8, y + 20, 4, 8)
-           .fill('#FF9800')
-           .rect(x + 14, y + 16, 4, 12)
-           .fill('#FF9800')
-           .rect(x + 20, y + 12, 4, 16)
-           .fill('#FF9800');
-        break;
-      case 'Google Ads Conversion':
-        // Ads icon - simple "Ad" representation
-        doc.roundedRect(x + 6, y + 10, 20, 12, 2)
-           .fill('#34A853')
-           .fontSize(8)
-           .fillColor('#FFFFFF')
-           .text('Ad', x + 14, y + 14);
-        break;
-      case 'Meta Pixel':
-        // Meta icon - "f" representation
-        doc.circle(x + iconSize/2, y + iconSize/2, 12)
-           .fill('#1877F2')
-           .fontSize(12)
-           .fillColor('#FFFFFF')
-           .text('f', x + iconSize/2 - 3, y + iconSize/2 - 6);
-        break;
-      case 'CMS':
-        // CMS icon - simple "CMS" representation
-        doc.roundedRect(x + 4, y + 8, 24, 16, 2)
-           .fill('#6366F1')
+    try {
+      let iconPath = '';
+      
+      // Map tag names to their actual icon files
+      switch (tagName) {
+        case 'Google Tag Manager':
+          iconPath = this.getIconPath('tags', 'GTM.png');
+          break;
+        case 'GA4':
+          iconPath = this.getIconPath('tags', 'GA4.png');
+          break;
+        case 'Google Ads Conversion':
+          iconPath = this.getIconPath('tags', 'GAC.png');
+          break;
+        case 'Meta Pixel':
+          iconPath = this.getIconPath('tags', 'meta.png');
+          break;
+        case 'CMS':
+          // Will be handled separately in addBottomSection
+          return;
+        default:
+          // Generic tag icon fallback
+          doc.roundedRect(x, y, iconSize, iconSize, 4)
+             .fill('#F3F4F6')
+             .fontSize(8)
+             .fillColor('#6B7280')
+             .text('TAG', x + 3, y + iconSize/2 - 3);
+          return;
+      }
+      
+      // Check if file exists and load it
+      if (iconPath && fs.existsSync(iconPath)) {
+        if (iconPath.endsWith('.svg')) {
+          // Generic SVG fallback for any remaining SVG files
+          doc.roundedRect(x, y, iconSize, iconSize, 4)
+             .fill('#F3F4F6')
+             .fontSize(8)
+             .fillColor('#6B7280')
+             .text('SVG', x + 4, y + iconSize/2 - 4);
+        } else {
+          // For PNG files, embed them directly
+          doc.image(iconPath, x, y, { 
+            width: iconSize, 
+            height: iconSize 
+          });
+        }
+      } else {
+        // Fallback if file doesn't exist
+        doc.roundedRect(x, y, iconSize, iconSize, 4)
+           .fill('#F3F4F6')
            .fontSize(7)
-           .fillColor('#FFFFFF')
-           .text('CMS', x + 11, y + 14);
-        break;
-      default:
-        // Generic tag icon
-        doc.fontSize(10)
            .fillColor('#6B7280')
-           .text('TAG', x + 6, y + 12);
+           .text(tagName.slice(0, 3).toUpperCase(), x + 3, y + iconSize/2 - 3);
+      }
+    } catch (error) {
+      console.error(`Error loading icon for ${tagName}:`, error);
+      
+      // Fallback rendering
+      doc.roundedRect(x, y, iconSize, iconSize, 4)
+         .fill('#F3F4F6')
+         .fontSize(7)
+         .fillColor('#6B7280')
+         .text(tagName.slice(0, 3).toUpperCase(), x + 3, y + iconSize/2 - 3);
+    }
+  }
+
+  /**
+   * Draws CMS icons using actual logo files
+   */
+  private drawCMSIcon(doc: PDFKit.PDFDocument, cmsName: string, x: number, y: number) {
+    const iconSize = 24; // Reduced from 32
+    
+    try {
+      let iconPath = '';
+      const lowerCMS = cmsName.toLowerCase();
+      
+      // Map CMS names to their logo files
+      if (lowerCMS.includes('hubspot')) {
+        iconPath = this.getIconPath('logos', 'hubspot.jpg');
+      } else if (lowerCMS.includes('wordpress')) {
+        // WordPress icon fallback
+        doc.roundedRect(x, y, iconSize, iconSize, 4)
+           .fill('#21759B')
+           .fontSize(10)
+           .fillColor('#FFFFFF')
+           .text('W', x + iconSize/2 - 5, y + iconSize/2 - 5);
+        return;
+      } else if (lowerCMS.includes('webflow')) {
+        iconPath = this.getIconPath('logos', 'webflow.jpg');
+      } else {
+        // Generic CMS icon
+        doc.roundedRect(x + 2, y + 6, 20, 12, 2)
+           .fill('#6366F1')
+           .fontSize(6)
+           .fillColor('#FFFFFF')
+           .text('CMS', x + 8, y + 10);
+        return;
+      }
+      
+      // Check if file exists and load it
+      if (iconPath && fs.existsSync(iconPath)) {
+        doc.image(iconPath, x, y, { 
+          width: iconSize, 
+          height: iconSize 
+        });
+      } else {
+        // Fallback if file doesn't exist
+        doc.roundedRect(x + 2, y + 6, 20, 12, 2)
+           .fill('#6366F1')
+           .fontSize(6)
+           .fillColor('#FFFFFF')
+           .text('CMS', x + 8, y + 10);
+      }
+    } catch (error) {
+      console.error(`Error loading CMS icon for ${cmsName}:`, error);
+      
+      // Fallback rendering
+      doc.roundedRect(x + 2, y + 6, 20, 12, 2)
+         .fill('#6366F1')
+         .fontSize(6)
+         .fillColor('#FFFFFF')
+         .text('CMS', x + 8, y + 10);
     }
   }
 
