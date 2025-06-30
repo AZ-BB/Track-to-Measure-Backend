@@ -52,16 +52,10 @@ export class ReportService {
       
       // Add content to PDF
       this.addHeader(doc, scanResult, theme);
-      this.addSummary(doc, scanResult, theme);
       this.addTagResults(doc, scanResult.tags, theme);
       
-      if (options.includeRecommendations && scanResult.recommendations && scanResult.recommendations.length > 0) {
-        this.addRecommendations(doc, scanResult.recommendations, theme);
-      }
-      
-      if (options.includeCmsInfo && scanResult.cms) {
-        this.addCmsInfo(doc, scanResult.cms, theme);
-      }
+      // Add bottom section with two columns
+      this.addBottomSection(doc, scanResult, options, theme);
       
       this.addFooter(doc, theme);
       
@@ -132,217 +126,339 @@ export class ReportService {
    * Adds header to the PDF
    */
   private addHeader(doc: PDFKit.PDFDocument, scanResult: ScanResult, theme: any) {
-    // Add logo and title
-    doc.fontSize(24)
-       .fillColor(theme.primary)
-       .text('TrackToMeasure', { align: 'center' })
-       .fontSize(18)
-       .fillColor(theme.text)
-       .text('Marketing Tag Scan Report', { align: 'center' })
-       .moveDown(0.5);
-       
-    // Add scan information
-    doc.fontSize(12)
-       .fillColor(theme.text)
-       .text(`Website: ${scanResult.domain}`, { align: 'center' })
-       .fillColor(theme.lightText)
-       .text(`Scan Date: ${new Date(scanResult.scanTime).toLocaleString()}`, { align: 'center' })
-       .moveDown(1);
-       
-    // Add horizontal line
-    doc.strokeColor(theme.border)
-       .lineWidth(1)
-       .moveTo(50, doc.y)
-       .lineTo(doc.page.width - 50, doc.y)
-       .stroke()
-       .moveDown(1);
-  }
-  
-  /**
-   * Adds summary to the PDF
-   */
-  private addSummary(doc: PDFKit.PDFDocument, scanResult: ScanResult, theme: any) {
+    // Calculate health score
     const presentTags = scanResult.tags.filter(tag => tag.isPresent).length;
     const totalTags = scanResult.tags.length;
+    const healthScore = Math.round((presentTags / totalTags) * 100);
     
-    doc.fontSize(16)
-       .fillColor(theme.text)
-       .text('Summary', { underline: true })
+    // Main title - more compact
+    doc.fontSize(24)
+       .fillColor('#1F2937')
+       .text('Website Tag Audit Report', 50, 40)
        .moveDown(0.5);
-       
-    doc.fontSize(12)
-       .fillColor(theme.text)
-       .text(`Found ${presentTags} out of ${totalTags} marketing tags on your website.`, { continued: false })
-       .moveDown(0.5);
-       
-    // Create a simple "gauge" to show progress
-    const gaugeWidth = 400;
-    const gaugeHeight = 24;
-    const x = (doc.page.width - gaugeWidth) / 2;
-    const y = doc.y;
     
-    // Background
-    doc.roundedRect(x, y, gaugeWidth, gaugeHeight, 4)
-       .fillAndStroke('#E5E7EB', theme.border);
+    // Two-column layout for subtitle and health score
+    const leftColumnX = 50;
+    const rightColumnX = 400;
+    const currentY = doc.y;
+    
+    // Left column - domain and date
+    doc.fontSize(13)
+       .fillColor('#2563EB')
+       .text(`for `, leftColumnX, currentY, { continued: true })
+       .fillColor('#2563EB')
+       .text(`${scanResult.domain}`, { continued: false })
+       .fontSize(11)
+       .fillColor('#6B7280')
+       .text(`Audit date: ${new Date(scanResult.scanTime).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}`, leftColumnX, doc.y + 3);
+    
+    // Right column - health score
+    doc.fontSize(11)
+       .fillColor('#6B7280')
+       .text('Tracking', rightColumnX, currentY)
+       .text('Health score', rightColumnX, currentY + 12)
+       .fontSize(36)
+       .fillColor('#2563EB')
+       .text(`${healthScore}`, rightColumnX, currentY + 25);
        
-    // Progress bar
-    const progressWidth = Math.max(4, (presentTags / totalTags) * gaugeWidth);
-    const progressColor = presentTags === 0 ? theme.error :
-                         presentTags < totalTags / 2 ? theme.warning :
-                         theme.success;
-                         
-    doc.roundedRect(x, y, progressWidth, gaugeHeight, 4)
-       .fill(progressColor);
-       
-    // Percentage
-    const percentage = Math.round((presentTags / totalTags) * 100);
-    doc.fontSize(12)
-       .fillColor('#FFFFFF')
-       .text(`${percentage}%`, x + progressWidth / 2 - 10, y + 5)
-       .moveDown(2);
+    doc.moveDown(1.5);
   }
+  
+
   
   /**
    * Adds tag results to the PDF
    */
   private addTagResults(doc: PDFKit.PDFDocument, tags: TagResult[], theme: any) {
-    doc.fontSize(16)
-       .fillColor(theme.text)
-       .text('Marketing Tags', { underline: true })
+    // Section title - more compact
+    doc.fontSize(18)
+       .fillColor('#1F2937')
+       .text('Tag Detection Summary', 50, doc.y)
        .moveDown(0.5);
        
-    // Create a table for tag results
+    // Container with border
+    const containerX = 50;
+    const containerWidth = 500;
     const startY = doc.y;
-    const rowHeight = 40;
-    const colWidths = [200, 100, 150];
-    const tableWidth = colWidths.reduce((a, b) => a + b, 0);
-    const startX = (doc.page.width - tableWidth) / 2;
     
-    // Table header
-    doc.fontSize(12)
-       .fillColor('#FFFFFF')
-       .rect(startX, startY, colWidths[0], rowHeight)
-       .fill(theme.primary)
-       .rect(startX + colWidths[0], startY, colWidths[1], rowHeight)
-       .fill(theme.primary)
-       .rect(startX + colWidths[0] + colWidths[1], startY, colWidths[2], rowHeight)
-       .fill(theme.primary);
-       
-    doc.fillColor('#FFFFFF')
-       .text('Tag Name', startX + 10, startY + 12)
-       .text('Status', startX + colWidths[0] + 10, startY + 12)
-       .text('ID/Details', startX + colWidths[0] + colWidths[1] + 10, startY + 12);
-       
-    // Table rows
-    let currentY = startY + rowHeight;
+    // Calculate total height needed - make more compact
+    let totalHeight = 0;
+    tags.forEach(tag => {
+      let rowHeight = 45; // Reduced base height
+      // Add extra height for multiple IDs but keep compact
+      if (tag.ids && tag.ids.length > 1) {
+        rowHeight += (tag.ids.length - 1) * 12;
+      }
+      totalHeight += rowHeight;
+    });
+    
+    // Draw container background and border
+    doc.roundedRect(containerX, startY, containerWidth, totalHeight, 8)
+       .fillAndStroke('#F9FAFB', '#D1D5DB');
+    
+    let currentY = startY + 15;
     
     tags.forEach((tag, index) => {
-      // Check if we need a new page
-      if (currentY + rowHeight > doc.page.height - 100) {
-        doc.addPage();
-        currentY = 50;
+      // Calculate row height based on number of IDs - more compact
+      let rowHeight = 45;
+      if (tag.ids && tag.ids.length > 1) {
+        rowHeight += (tag.ids.length - 1) * 12;
       }
       
-      const rowColor = index % 2 === 0 ? '#FFFFFF' : theme.background;
+      // Add border between rows (except for first row)
+      if (index > 0) {
+        doc.strokeColor('#D1D5DB')
+           .lineWidth(1)
+           .moveTo(containerX, currentY - 8)
+           .lineTo(containerX + containerWidth, currentY - 8)
+           .stroke();
+      }
       
-      // Row background
-      doc.rect(startX, currentY, tableWidth, rowHeight)
-         .fill(rowColor);
-         
-      // Add tag info
-      doc.fillColor(theme.text)
-         .text(tag.name, startX + 10, currentY + 12);
-         
-      // Tag status (with colored circle)
-      const statusX = startX + colWidths[0] + 10;
-      const statusY = currentY + 12;
+      // Tag icon area - smaller
+      const iconX = containerX + 15;
+      const iconY = currentY;
+      this.drawTagIcon(doc, tag.name, iconX, iconY);
       
-      // Status circle
-      doc.circle(statusX + 8, statusY + 8, 6)
-         .fill(tag.isPresent ? theme.success : theme.error);
-         
-      // Status text
-      doc.fillColor(theme.text)
-         .text(tag.isPresent ? 'Detected' : 'Missing', statusX + 20, statusY);
-         
-      // Tag ID or details
-      doc.fillColor(theme.lightText)
-         .text(tag.id || '—', startX + colWidths[0] + colWidths[1] + 10, currentY + 12);
-         
-      // Border lines
-      doc.strokeColor(theme.border)
-         .lineWidth(0.5)
-         .rect(startX, currentY, tableWidth, rowHeight)
-         .stroke();
-         
+      // Tag name
+      doc.fontSize(13)
+         .fillColor('#1F2937')
+         .text(tag.name, iconX + 40, iconY + 2);
+      
+      // Tag IDs (displayed below tag name in blue) - more compact
+      const idsY = iconY + 18;
+      if (tag.ids && tag.ids.length > 0) {
+        tag.ids.forEach((id, idIndex) => {
+          doc.fontSize(9)
+             .fillColor('#2563EB')
+             .text(`ID: ${id}`, iconX + 40, idsY + (idIndex * 12));
+        });
+      } else if (tag.id) {
+        doc.fontSize(9)
+           .fillColor('#2563EB')
+           .text(`ID: ${tag.id}`, iconX + 40, idsY);
+      }
+      
+      // Status on the right side
+      const statusX = containerX + containerWidth - 90;
+      const statusY = iconY + 8;
+      
+      if (tag.isPresent) {
+        // Green checkmark circle
+        doc.circle(statusX + 40, statusY, 7)
+           .fill('#10B981');
+           
+        // Checkmark (simple approximation)
+        doc.strokeColor('#FFFFFF')
+           .lineWidth(2)
+           .moveTo(statusX + 37, statusY)
+           .lineTo(statusX + 39, statusY + 2)
+           .lineTo(statusX + 43, statusY - 2)
+           .stroke();
+           
+        // Status text
+        doc.fontSize(11)
+           .fillColor('#6B7280')
+           .text('Installed', statusX - 15, statusY - 4);
+      } else {
+        // Red X circle
+        doc.circle(statusX + 40, statusY, 7)
+           .fill('#EF4444');
+           
+        // X mark
+        doc.strokeColor('#FFFFFF')
+           .lineWidth(2)
+           .moveTo(statusX + 37, statusY - 3)
+           .lineTo(statusX + 43, statusY + 3)
+           .stroke()
+           .moveTo(statusX + 43, statusY - 3)
+           .lineTo(statusX + 37, statusY + 3)
+           .stroke();
+           
+        // Status text
+        doc.fontSize(11)
+           .fillColor('#6B7280')
+           .text('Not Found', statusX - 25, statusY - 4);
+      }
+      
       currentY += rowHeight;
     });
     
-    doc.moveDown(2);
+    doc.y = startY + totalHeight + 20;
   }
   
   /**
-   * Adds recommendations to the PDF
+   * Adds bottom section with two columns
    */
-  private addRecommendations(doc: PDFKit.PDFDocument, recommendations: string[], theme: any) {
-    doc.fontSize(16)
-       .fillColor(theme.text)
-       .text('Recommendations', { underline: true })
-       .moveDown(0.5);
-       
-    // Background box
-    const boxWidth = 450;
-    const lineHeight = 22;
-    const boxHeight = recommendations.length * lineHeight + 30;
-    const boxX = (doc.page.width - boxWidth) / 2;
-    const boxY = doc.y;
+  private addBottomSection(doc: PDFKit.PDFDocument, scanResult: ScanResult, options: ReportOptions, theme: any) {
+    const leftColumnX = 50;
+    const rightColumnX = 320;
+    const columnWidth = 230;
+    const startY = doc.y;
     
-    doc.roundedRect(boxX, boxY, boxWidth, boxHeight, 4)
-       .fillAndStroke('#F1F5F9', theme.border);
-       
-    // Add recommendations as bullet points
-    doc.fontSize(12)
-       .fillColor(theme.text);
-       
-    recommendations.forEach((recommendation, index) => {
-      doc.text(`• ${recommendation}`, boxX + 20, boxY + 20 + (index * lineHeight));
-    });
+    // Left Column - Technology Detected (more compact)
+    doc.fontSize(18)
+       .fillColor('#1F2937')
+       .text('Technology Detected', leftColumnX, startY);
     
-    doc.moveDown(2);
+    if (scanResult.cms) {
+      // CMS detected with icon
+      this.drawTagIcon(doc, 'CMS', leftColumnX, startY + 30);
+      doc.fontSize(13)
+         .fillColor('#1F2937')
+         .text(scanResult.cms, leftColumnX + 40, startY + 35);
+    } else {
+      // No CMS detected - warning icon and text
+      doc.circle(leftColumnX + 12, startY + 40, 10)
+         .fill('#F59E0B');
+         
+      // Warning triangle
+      doc.polygon([leftColumnX + 8, startY + 44], [leftColumnX + 16, startY + 44], [leftColumnX + 12, startY + 36])
+         .fill('#FFFFFF');
+      doc.fontSize(7)
+         .fillColor('#F59E0B')
+         .text('!', leftColumnX + 11, startY + 38);
+         
+      doc.fontSize(13)
+         .fillColor('#1F2937')
+         .text('No CMS detected', leftColumnX + 30, startY + 36);
+    }
+    
+    // Right Column - Recommendations
+    doc.fontSize(18)
+       .fillColor('#1F2937')
+       .text('Recommendations', rightColumnX, startY);
+    
+    if (options.includeRecommendations && scanResult.recommendations && scanResult.recommendations.length > 0) {
+      let currentY = startY + 30;
+      
+      scanResult.recommendations.forEach((recommendation, index) => {
+        // Green checkmark for positive recommendations, warning for issues
+        const isPositive = recommendation.includes('properly configured');
+        const iconColor = isPositive ? '#10B981' : '#F59E0B';
+        
+        doc.circle(rightColumnX + 6, currentY + 6, 6)
+           .fill(iconColor);
+           
+        if (isPositive) {
+          // Checkmark
+          doc.strokeColor('#FFFFFF')
+             .lineWidth(1.5)
+             .moveTo(rightColumnX + 3, currentY + 6)
+             .lineTo(rightColumnX + 5, currentY + 8)
+             .lineTo(rightColumnX + 9, currentY + 4)
+             .stroke();
+        } else {
+          // Warning triangle
+          doc.polygon([rightColumnX + 3, currentY + 9], [rightColumnX + 9, currentY + 9], [rightColumnX + 6, currentY + 3])
+             .fill('#FFFFFF');
+        }
+        
+        // Recommendation text - more compact
+        doc.fontSize(11)
+           .fillColor('#1F2937')
+           .text(recommendation, rightColumnX + 18, currentY + 2, {
+             width: columnWidth - 18,
+             align: 'left'
+           });
+           
+        currentY += 25;
+      });
+    } else {
+      // Default positive message
+      doc.circle(rightColumnX + 6, startY + 36, 6)
+         .fill('#10B981');
+         
+      // Checkmark
+      doc.strokeColor('#FFFFFF')
+         .lineWidth(1.5)
+         .moveTo(rightColumnX + 3, startY + 36)
+         .lineTo(rightColumnX + 5, startY + 38)
+         .lineTo(rightColumnX + 9, startY + 34)
+         .stroke();
+         
+      doc.fontSize(11)
+         .fillColor('#1F2937')
+         .text('All tags are properly configured!', rightColumnX + 18, startY + 32);
+    }
+    
+    doc.y = startY + 80; // Much more compact spacing
   }
   
   /**
-   * Adds CMS information to the PDF
+   * Draws tag icons
    */
-  private addCmsInfo(doc: PDFKit.PDFDocument, cms: string, theme: any) {
-    doc.fontSize(16)
-       .fillColor(theme.text)
-       .text('CMS Information', { underline: true })
-       .moveDown(0.5);
+  private drawTagIcon(doc: PDFKit.PDFDocument, tagName: string, x: number, y: number) {
+    const iconSize = 32;
+    
+    // Draw background circle/square for icon
+    doc.roundedRect(x, y, iconSize, iconSize, 4)
+       .fill('#F3F4F6');
+    
+    // Simple icon representations based on tag type
+    doc.fontSize(8)
+       .fillColor('#6B7280');
        
-    doc.fontSize(12)
-       .fillColor(theme.text)
-       .text(`Your website is built on: ${cms}`, { continued: false })
-       .moveDown(2);
+    switch (tagName) {
+      case 'Google Tag Manager':
+        // GTM icon - simple "G" representation
+        doc.circle(x + iconSize/2, y + iconSize/2, 12)
+           .fill('#4285F4')
+           .fontSize(12)
+           .fillColor('#FFFFFF')
+           .text('G', x + iconSize/2 - 4, y + iconSize/2 - 6);
+        break;
+      case 'GA4':
+        // GA4 icon - analytics chart representation
+        doc.rect(x + 8, y + 20, 4, 8)
+           .fill('#FF9800')
+           .rect(x + 14, y + 16, 4, 12)
+           .fill('#FF9800')
+           .rect(x + 20, y + 12, 4, 16)
+           .fill('#FF9800');
+        break;
+      case 'Google Ads Conversion':
+        // Ads icon - simple "Ad" representation
+        doc.roundedRect(x + 6, y + 10, 20, 12, 2)
+           .fill('#34A853')
+           .fontSize(8)
+           .fillColor('#FFFFFF')
+           .text('Ad', x + 14, y + 14);
+        break;
+      case 'Meta Pixel':
+        // Meta icon - "f" representation
+        doc.circle(x + iconSize/2, y + iconSize/2, 12)
+           .fill('#1877F2')
+           .fontSize(12)
+           .fillColor('#FFFFFF')
+           .text('f', x + iconSize/2 - 3, y + iconSize/2 - 6);
+        break;
+      case 'CMS':
+        // CMS icon - simple "CMS" representation
+        doc.roundedRect(x + 4, y + 8, 24, 16, 2)
+           .fill('#6366F1')
+           .fontSize(7)
+           .fillColor('#FFFFFF')
+           .text('CMS', x + 11, y + 14);
+        break;
+      default:
+        // Generic tag icon
+        doc.fontSize(10)
+           .fillColor('#6B7280')
+           .text('TAG', x + 6, y + 12);
+    }
   }
-  
+
   /**
    * Adds footer to the PDF
    */
   private addFooter(doc: PDFKit.PDFDocument, theme: any) {
-    const pageCount = doc.bufferedPageRange().count;
+    // Simply add footer to current page
+    const text = `Prepared by TrackToMeasure - Smart tools for marketers and freelancers`;
+    const textWidth = doc.widthOfString(text);
+    const textX = (doc.page.width - textWidth) / 2;
     
-    for (let i = 0; i < pageCount; i++) {
-      doc.switchToPage(i);
-      
-      // Footer text
-      const text = `Generated by TrackToMeasure | Page ${i + 1} of ${pageCount}`;
-      const textWidth = doc.widthOfString(text);
-      const textX = (doc.page.width - textWidth) / 2;
-      
-      doc.fontSize(10)
-         .fillColor(theme.lightText)
-         .text(text, textX, doc.page.height - 50);
-    }
+    doc.fontSize(10)
+       .fillColor('#9CA3AF')
+       .text(text, textX, doc.page.height - 50);
   }
 } 
